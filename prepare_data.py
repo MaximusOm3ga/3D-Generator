@@ -20,7 +20,14 @@ def decimate_mesh(mesh, max_faces=MAX_FACES):
     """
     if len(mesh.faces) <= max_faces:
         return mesh
-    return mesh.simplify_quadric_decimation(face_count=max_faces)
+    try:
+        return mesh.simplify_quadric_decimation(face_count=max_faces)
+    except Exception:
+        # The decimation backend can choke on pathological/degenerate input
+        # geometry (duplicate/zero-area triangles etc, common in scraped
+        # assets). Fall back to the full-resolution mesh rather than
+        # propagating -- slower for this one object, not a lost object.
+        return mesh
 
 
 def load_filtered_uids(min_score=2, max_objects=2000):
@@ -123,38 +130,66 @@ def run(min_score=2, max_objects=2000):
     uid_to_path = download_meshes(uids)
 
     kept, skipped = 0, 0
-    skip_reasons = {"repair_failed": 0, "skeleton_failed": 0}
+    skip_reasons = {"repair_failed": 0, "skeleton_failed": 0, "exception": 0}
+    errors = []  # (uid, exception message) for anything unexpected
+
     for uid, path in uid_to_path.items():
         if (kept + skipped) % 50 == 0:
             print(f"processed {kept + skipped}/{len(uid_to_path)} objects...", flush=True)
-        mesh = repair_mesh(path)
-        if mesh is None:
-            skipped += 1
-            skip_reasons["repair_failed"] += 1
+
+        out_path = os.path.join(OUTPUT_DIR, f"{uid}.npz")
+        if os.path.exists(out_path):
+            # Already processed in a previous run (e.g. one that crashed
+            # partway through) -- skip the expensive work and count it as kept.
+            kept += 1
             continue
 
-        skel_points = extract_skeleton_points(mesh)
-        if skel_points is None:
-            skipped += 1
-            skip_reasons["skeleton_failed"] += 1
-            continue
+        try:
+            mesh = repair_mesh(path)
+            if mesh is None:
+                skipped += 1
+                skip_reasons["repair_failed"] += 1
+                continue
 
-        np.savez(
-            os.path.join(OUTPUT_DIR, f"{uid}.npz"),
-            mesh_vertices=mesh.vertices.astype(np.float32),
-            mesh_faces=mesh.faces.astype(np.int64),
-            skeleton_points=skel_points,
-        )
-        kept += 1
-        if kept % 50 == 0:
-            print(f"kept {kept} repaired objects so far", flush=True)
+            skel_points = extract_skeleton_points(mesh)
+            if skel_points is None:
+                skipped += 1
+                skip_reasons["skeleton_failed"] += 1
+                continue
+
+            np.savez(
+                out_path,
+                mesh_vertices=mesh.vertices.astype(np.float32),
+                mesh_faces=mesh.faces.astype(np.int64),
+                skeleton_points=skel_points,
+            )
+            kept += 1
+            if kept % 50 == 0:
+                print(f"kept {kept} repaired objects so far", flush=True)
+
+        except Exception as e:
+            # A single malformed mesh (bad decimation result, pymeshfix
+            # choking on pathological geometry, skeletor hitting an edge
+            # case) must never take down a multi-hour batch run over the
+            # other 299 objects -- log it and move on.
+            skipped += 1
+            skip_reasons["exception"] += 1
+            errors.append((uid, f"{type(e).__name__}: {e}"))
+            print(f"  {uid}: unhandled exception, skipping ({type(e).__name__}: {e})", flush=True)
 
     print(f"Done. kept={kept} skipped={skipped}")
     print(
         "Skip breakdown: "
         f"repair_failed={skip_reasons['repair_failed']} "
-        f"skeleton_failed={skip_reasons['skeleton_failed']}"
+        f"skeleton_failed={skip_reasons['skeleton_failed']} "
+        f"exception={skip_reasons['exception']}"
     )
+    if errors:
+        print(f"\n{len(errors)} object(s) raised an exception:")
+        for uid, msg in errors[:20]:
+            print(f"  {uid}: {msg}")
+        if len(errors) > 20:
+            print(f"  ... and {len(errors) - 20} more")
 
 
 if __name__ == "__main__":
