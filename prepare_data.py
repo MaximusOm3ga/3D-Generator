@@ -193,4 +193,10 @@ def run(min_score=2, max_objects=2000):
 
 
 if __name__ == "__main__":
-    run(min_score=2, max_objects=500)
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--min-score", type=int, default=2)
+    parser.add_argument("--max-objects", type=int, default=500)
+    args = parser.parse_args()
+    run(min_score=args.min_score, max_objects=args.max_objects)
