@@ -217,6 +217,95 @@ class TriplaneLatentVAE(nn.Module):
         return z, mean, logvar
 
 
+class TriplaneDecoder(nn.Module):
+    """
+    Decodes a triplane latent into occupancy at arbitrary 3D query points.
+
+    Standard convolutional-occupancy-network-style decoding: project each
+    query point onto the xy, yz, and xz planes, bilinearly sample the
+    corresponding feature map at that 2D location (torch's grid_sample --
+    this is the differentiable part that makes triplane decoding trainable
+    end to end), sum the three sampled features, concatenate a Fourier
+    positional embedding of the raw xyz, then an MLP predicts occupancy.
+    """
+
+    def __init__(self, latent_channels=16, embed_dim=128, hidden_dim=128):
+        super().__init__()
+        self.pos_embed = PointEmbed(out_dim=embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(latent_channels + embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def _sample_plane(self, plane_img, coords_2d):
+        # plane_img: (B, C, R, R)   coords_2d: (B, Q, 2) in [-1, 1]
+        grid = coords_2d.unsqueeze(2)  # (B, Q, 1, 2) -- grid_sample's expected shape
+        sampled = torch.nn.functional.grid_sample(
+            plane_img, grid, mode="bilinear", padding_mode="border", align_corners=True
+        )  # (B, C, Q, 1)
+        return sampled.squeeze(-1).transpose(1, 2)  # (B, Q, C)
+
+    def forward(self, query_points, triplane_latent):
+        # query_points: (B, Q, 3) in [-1, 1]
+        # triplane_latent: (B, 3, R, R, C) -- planes ordered [xy, yz, xz]
+        xy_img = triplane_latent[:, 0].permute(0, 3, 1, 2)
+        yz_img = triplane_latent[:, 1].permute(0, 3, 1, 2)
+        xz_img = triplane_latent[:, 2].permute(0, 3, 1, 2)
+
+        xy_feat = self._sample_plane(xy_img, query_points[:, :, [0, 1]])
+        yz_feat = self._sample_plane(yz_img, query_points[:, :, [1, 2]])
+        xz_feat = self._sample_plane(xz_img, query_points[:, :, [0, 2]])
+
+        combined = xy_feat + yz_feat + xz_feat  # (B, Q, C)
+        pos = self.pos_embed(query_points)  # (B, Q, embed_dim)
+        occupancy_logits = self.mlp(torch.cat([combined, pos], dim=-1)).squeeze(-1)
+        return occupancy_logits
+
+
+class TriplaneVAE(nn.Module):
+    """
+    Wraps TriplaneLatentVAE (encoder) + TriplaneDecoder into one module with
+    the same forward signature as SkeletalVAE -- (logits, mean, logvar) --
+    so train_vae.py needs minimal changes, and exposes .encode() so
+    encode_latents.py can load ONE consistent checkpoint instead of loading
+    a SkeletalVAE checkpoint into a mismatched class.
+    """
+
+    def __init__(
+        self,
+        in_channels=54,
+        hidden_dim=768,
+        latent_channels=16,
+        latent_res=32,
+        decoder_hidden_dim=128,
+    ):
+        super().__init__()
+        self.encoder = TriplaneLatentVAE(
+            in_channels=in_channels,
+            hidden_dim=hidden_dim,
+            latent_channels=latent_channels,
+            latent_res=latent_res,
+        )
+        self.decoder = TriplaneDecoder(
+            latent_channels=latent_channels, hidden_dim=decoder_hidden_dim
+        )
+
+    def encode(self, surface_features, surface_xyz):
+        return self.encoder.encode(surface_features, surface_xyz)
+
+    def reparameterize(self, mean, logvar):
+        return self.encoder.reparameterize(mean, logvar)
+
+    def forward(self, surface_features, surface_xyz, query_points):
+        mean, logvar = self.encoder.encode(surface_features, surface_xyz)
+        z = self.encoder.reparameterize(mean, logvar)
+        occupancy_logits = self.decoder(query_points, z)
+        return occupancy_logits, mean, logvar
+
+
 def vae_loss(occupancy_logits, occupancy_labels, mean, logvar, kl_weight=1e-4):
     recon_loss = nn.functional.binary_cross_entropy_with_logits(
         occupancy_logits, occupancy_labels
@@ -230,6 +319,7 @@ if __name__ == "__main__":
     # end to end before wiring up the real data loader.
     batch_size, n_surface, n_skeleton, n_query = 2, 2048, 256, 4096
 
+    print("--- SkeletalVAE (legacy) ---")
     model = SkeletalVAE()
     surface_points = torch.randn(batch_size, n_surface, 3)
     skeleton_points = torch.randn(batch_size, n_skeleton, 3)
@@ -238,7 +328,29 @@ if __name__ == "__main__":
 
     logits, mean, logvar = model(surface_points, skeleton_points, query_points)
     loss, recon, kl = vae_loss(logits, labels, mean, logvar)
-
     print("occupancy_logits:", logits.shape)
     print("latent mean:", mean.shape, "latent logvar:", logvar.shape)
     print(f"loss={loss.item():.4f} recon={recon.item():.4f} kl={kl.item():.4f}")
+
+    print("\n--- TriplaneVAE (current) ---")
+    # Deliberately tiny config here -- this smoke test only validates that
+    # shapes flow correctly, not real training. The repo's actual defaults
+    # (hidden_dim=768, latent_res=32) are memory-heavy: 3 planes x 32x32 =
+    # 3072 tokens through self-attention is a large attention matrix, and
+    # caused an OOM kill when tested at full size on this sandbox. Worth
+    # sizing down for Colab free tier / a 4GB local GPU regardless.
+    in_channels = 54
+    with torch.no_grad():
+        triplane_model = TriplaneVAE(
+            in_channels=in_channels, hidden_dim=64, latent_channels=8, latent_res=8
+        )
+        surface_features = torch.randn(batch_size, 128, in_channels)
+        surface_xyz = torch.randn(batch_size, 128, 3)
+        query_points_t = torch.rand(batch_size, 256, 3) * 2 - 1  # in [-1, 1]
+        labels_t = torch.randint(0, 2, (batch_size, 256)).float()
+
+        t_logits, t_mean, t_logvar = triplane_model(surface_features, surface_xyz, query_points_t)
+    t_loss, t_recon, t_kl = vae_loss(t_logits, labels_t, t_mean, t_logvar)
+    print("occupancy_logits:", t_logits.shape)
+    print("triplane latent mean:", t_mean.shape, "logvar:", t_logvar.shape)
+    print(f"loss={t_loss.item():.4f} recon={t_recon.item():.4f} kl={t_kl.item():.4f}")

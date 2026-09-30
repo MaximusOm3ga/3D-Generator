@@ -50,26 +50,56 @@ def repair_mesh(path):
             [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
         )
 
-    if loaded is None or len(loaded.vertices) == 0:
+    if loaded is None or len(loaded.vertices) == 0 or len(loaded.faces) == 0:
         return None
 
-    fixer = pymeshfix.MeshFix(loaded.vertices, loaded.faces)
-    fixer.repair()
-    repaired = trimesh.Trimesh(vertices=fixer.points, faces=fixer.faces, process=True)
+    try:
+        fixer = pymeshfix.MeshFix(loaded.vertices, loaded.faces)
+        fixer.repair()
+    except Exception as e:
+        print(f"  mesh repair failed: {e}")
+        return None
 
-    if not repaired.is_watertight or len(repaired.vertices) == 0:
+    if getattr(fixer, "points", None) is None or len(fixer.points) == 0:
+        return None
+    if getattr(fixer, "faces", None) is None or len(fixer.faces) == 0:
+        return None
+
+    repaired = trimesh.Trimesh(vertices=fixer.points, faces=fixer.faces, process=False)
+    if len(repaired.vertices) == 0 or len(repaired.faces) == 0:
+        return None
+    if not repaired.is_watertight:
         return None
 
     repaired.vertices -= repaired.bounding_box.centroid
-    scale = 1.0 / max(repaired.bounding_box.extents)
+    extents = repaired.bounding_box.extents
+    if np.any(extents <= 0):
+        return None
+    scale = 1.0 / max(extents)
     repaired.vertices *= scale
 
     return repaired
 
 
 def extract_skeleton_points(mesh, n_points=N_SKELETON_POINTS):
-    fixed = sk.pre.fix_mesh(mesh, remove_disconnected=5, inplace=False)
-    skel = sk.skeletonize.by_wavefront(fixed, waves=1, step_size=1)
+    if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+        return None
+
+    try:
+        fixed = sk.pre.fix_mesh(mesh, remove_disconnected=5, inplace=False)
+    except Exception as e:
+        print(f"  skeleton fix failed: {e}")
+        return None
+
+    if fixed is None or len(fixed.vertices) == 0 or len(fixed.faces) == 0:
+        return None
+
+    try:
+        skel = sk.skeletonize.by_wavefront(fixed, waves=1, step_size=1)
+    except Exception as e:
+        print(f"  skeletonization failed: {e}")
+        return None
+
     skeleton_verts = np.asarray(skel.vertices)
 
     if len(skeleton_verts) == 0:
@@ -131,8 +161,9 @@ def run(min_score=2, max_objects=2000):
             skeleton_points=skel_points,
         )
         kept += 1
-        if kept % 50 == 0:
-            print(f"kept {kept} repaired objects so far", flush=True)
+
+        if kept % 25 == 0:
+            print(f"kept {kept} valid objects so far", flush=True)
 
     print(f"Done. kept={kept} skipped={skipped}")
     print(

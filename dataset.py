@@ -34,7 +34,7 @@ class SkeletalMeshDataset(Dataset):
     def __init__(
         self,
         cache_dir="cached_objects",
-        n_surface_points=81920,
+        n_surface_points=4096,
         n_query_points=4096,
         near_surface_std=0.01,
         include_normals=True,
