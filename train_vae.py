@@ -51,6 +51,15 @@ def parse_args():
     # cost of a literally larger batch -- useful on a 4GB card.
     p.add_argument("--accum-steps", type=int, default=4)
     p.add_argument("--amp", action="store_true", help="use mixed precision (torch.autocast)")
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader worker processes. Default 0 (main-process loading) because "
+        "Colab's small /dev/shm can cause workers to be silently killed once "
+        "PyTorch's shared-memory tensor buffers fill up -- raise this only if "
+        "you've confirmed your environment's /dev/shm can handle it.",
+    )
     return p.parse_args()
 
 
@@ -73,10 +82,17 @@ def make_dataloaders(args):
 
     train_set, val_set = random_split(full_dataset, [n_train, n_val])
     train_loader = DataLoader(
-        train_set, batch_size=effective_batch_size, shuffle=True, num_workers=2, drop_last=False
+        train_set,
+        batch_size=effective_batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        drop_last=False,
     )
     val_loader = DataLoader(
-        val_set, batch_size=effective_batch_size, shuffle=False, num_workers=2
+        val_set,
+        batch_size=effective_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
     )
     return train_loader, val_loader
 
