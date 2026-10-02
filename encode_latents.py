@@ -22,7 +22,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.out_dir, exist_ok=True)
 
-    checkpoint = torch.load(args.vae_ckpt, map_location=device)
+    checkpoint = torch.load(args.vae_ckpt, map_location=device, weights_only=False)
     # train_vae.py saves {"model_state": ..., "epoch": ..., "args": ...} --
     # unwrap it, and read the architecture config (embed_dim/latent_dim) back
     # out of it so this script can't silently mismatch what was actually

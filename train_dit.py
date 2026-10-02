@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 
 from latent_dataset import LatentTriplaneDataset, latent_collate_fn
 from dit_model import SkeletalDiT
+from checkpoint_utils import atomic_torch_save, capture_rng_state, restore_rng_state
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHECKPOINT_DIR = "checkpoints"
@@ -41,12 +42,18 @@ def parse_args():
     p.add_argument("--latent-dir", type=str, default="cached_latents")
     p.add_argument("--condition-dir", type=str, default="conditions")
     p.add_argument("--split", type=str, default="train")
+    p.add_argument("--checkpoint-dir", type=str, default=CHECKPOINT_DIR)
+    p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--epochs", type=int, default=N_EPOCHS)
+    p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    p.add_argument("--lr", type=float, default=LR)
+    p.add_argument("--checkpoint-every-steps", type=int, default=25)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
     ds = LatentTriplaneDataset(
         manifest_path=args.manifest,
         latent_dir=args.latent_dir,
@@ -55,8 +62,8 @@ def main():
     )
     loader = DataLoader(
         ds,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=0,
         drop_last=True,
         collate_fn=latent_collate_fn,
@@ -72,15 +79,47 @@ def main():
     print(f"Inferred latent shape from cached data: n_tokens={n_tokens} latent_dim={latent_dim}")
 
     model = SkeletalDiT(n_tokens=n_tokens, latent_dim=latent_dim).to(DEVICE)
-    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     _betas, _alphas, alphas_cumprod = make_schedule(TIMESTEPS, DEVICE)
 
-    for epoch in range(1, N_EPOCHS + 1):
+    start_epoch = 1
+    resume_step = 0
+    checkpoint = None
+    if args.resume and os.path.exists(args.resume):
+        print(f"Resuming from {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(checkpoint["model_state"])
+        if checkpoint.get("optimizer_state"):
+            opt.load_state_dict(checkpoint["optimizer_state"])
+        start_epoch = checkpoint.get("epoch", 0)
+        if checkpoint.get("batch_step", 0) == 0:
+            start_epoch += 1
+        resume_step = checkpoint.get("batch_step", 0)
+        restore_rng_state(checkpoint.get("rng_state"))
+
+    def save_checkpoint(epoch, batch_step):
+        atomic_torch_save(
+            {
+                "model_state": model.state_dict(),
+                "optimizer_state": opt.state_dict(),
+                "epoch": epoch,
+                "batch_step": batch_step,
+                "args": vars(args),
+                "n_tokens": n_tokens,
+                "latent_dim": latent_dim,
+                "rng_state": capture_rng_state(),
+            },
+            os.path.join(args.checkpoint_dir, "dit_last.pt"),
+        )
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         total = 0.0
         n = 0
-        print(f"starting epoch {epoch}/{N_EPOCHS}", flush=True)
+        print(f"starting epoch {epoch}/{args.epochs}", flush=True)
         for step, batch in enumerate(loader, start=1):
+            if epoch == start_epoch and step <= resume_step:
+                continue
             z0 = batch["latent"].to(DEVICE)
             bsz = z0.shape[0]
             t = torch.randint(0, TIMESTEPS, (bsz,), device=DEVICE)
@@ -108,9 +147,13 @@ def main():
                     flush=True,
                 )
 
+            if step % args.checkpoint_every_steps == 0:
+                save_checkpoint(epoch, step)
+
         avg = total / max(n, 1)
         print(f"epoch {epoch:03d} | diffusion loss {avg:.6f}")
-        torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "dit_last.pt"))
+        resume_step = 0
+        save_checkpoint(epoch, 0)
 
 
 if __name__ == "__main__":
