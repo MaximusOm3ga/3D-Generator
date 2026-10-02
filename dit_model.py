@@ -41,12 +41,6 @@ class DiTBlock(nn.Module):
 
 
 class SkeletalDiT(nn.Module):
-    """
-    DiT for SkeletalVAE's latent: a flat (B, N_tokens, latent_dim) sequence
-    already (256 skeleton-anchored tokens by default) -- no reshape into a
-    (3, R, R, C) grid needed the way TriplaneDiT requires, since the latent
-    is already sequence-shaped coming out of the VAE.
-    """
 
     def __init__(self, n_tokens=256, latent_dim=64, width=256, depth=6, heads=8, cond_dim=256):
         super().__init__()
@@ -64,7 +58,7 @@ class SkeletalDiT(nn.Module):
         self.out_proj = nn.Linear(width, latent_dim)
 
     def forward(self, z_noisy, timesteps, clip_tokens=None, dino_tokens=None):
-        # z_noisy: (B, n_tokens, latent_dim) -- already flat, nothing to reshape
+                                                                                
         x = self.in_proj(z_noisy)
 
         t_emb = timestep_embedding(timesteps, x.shape[-1])
@@ -81,7 +75,7 @@ class SkeletalDiT(nn.Module):
             x = block(x, cross_tokens=cross)
 
         pred = self.out_proj(self.out_norm(x))
-        return pred  # (B, n_tokens, latent_dim) -- same shape as z_noisy, no reshape back
+        return pred                                                                       
 
 
 class TriplaneDiT(nn.Module):

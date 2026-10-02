@@ -13,7 +13,18 @@ def parse_args():
     p.add_argument("--vae-ckpt", type=str, required=True)
     p.add_argument("--cache-dir", type=str, default="cached_objects")
     p.add_argument("--out-dir", type=str, default="cached_latents")
-    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument(
+        "--n-surface-points",
+        type=int,
+        default=None,
+        help="Override sampled surface points during encoding. Defaults to training value from checkpoint.",
+    )
+    p.add_argument(
+        "--amp",
+        action="store_true",
+        help="Use mixed precision during encoding on CUDA to reduce VRAM usage.",
+    )
     return p.parse_args()
 
 
@@ -23,11 +34,11 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     checkpoint = torch.load(args.vae_ckpt, map_location=device, weights_only=False)
-    # train_vae.py saves {"model_state": ..., "epoch": ..., "args": ...} --
-    # unwrap it, and read the architecture config (embed_dim/latent_dim) back
-    # out of it so this script can't silently mismatch what was actually
-    # trained. Falls back to SkeletalVAE's defaults only for an older
-    # bare-state-dict checkpoint that predates this change.
+                                                                           
+                                                                             
+                                                                        
+                                                                     
+                                                           
     if "model_state" in checkpoint:
         state = checkpoint["model_state"]
         train_args = checkpoint.get("args", {})
@@ -44,9 +55,13 @@ def main():
     for p in model.parameters():
         p.requires_grad = False
 
+    n_surface_points = args.n_surface_points
+    if n_surface_points is None:
+        n_surface_points = train_args.get("n_surface_points", 4096)
     ds = SkeletalMeshDataset(
         cache_dir=args.cache_dir,
-        n_surface_points=train_args.get("n_surface_points", 4096),
+        n_surface_points=n_surface_points,
+        include_occupancy=False,
     )
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
@@ -55,7 +70,11 @@ def main():
         for step, batch in enumerate(loader, start=1):
             xyz = batch["surface_xyz"].to(device)
             skeleton_points = batch["skeleton_points"].to(device)
-            mean, _ = model.encode(xyz, skeleton_points)
+            with torch.autocast(
+                device_type="cuda",
+                enabled=(args.amp and device == "cuda"),
+            ):
+                mean, _ = model.encode(xyz, skeleton_points)
             latents = mean.cpu().numpy()
 
             for i in range(latents.shape[0]):

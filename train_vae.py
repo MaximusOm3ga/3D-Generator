@@ -1,23 +1,3 @@
-"""
-Stage 2c: the actual training loop for the VAE.
-
-Run this after prepare_data.py has populated cached_objects/. This trains
-SkeletalVAE: a cross-attention encoder where each of the cached skeleton
-points is a query attending into the sampled surface point cloud, so every
-latent token is anchored to a specific location on the object's skeleton --
-plus its matching occupancy decoder. Jointly trained on reconstruction.
-Once val loss plateaus and reconstructions look right (see
-check_reconstruction below), freeze this model and move to encode_latents.py
-for DiT training -- that's a separate script, not this one.
-
-Much cheaper than the triplane alternative (vae_model.TriplaneVAE, still in
-this repo if you want to switch back): the skeleton-query encoder only ever
-does CROSS-attention from a small, fixed 256-point query set into the surface
-points (cost linear in surface point count), never self-attention over the
-full surface point cloud the way TriplaneLatentVAE's point_blocks do.
-
-pip install torch trimesh numpy scikit-image --break-system-packages
-"""
 
 import argparse
 import os
@@ -41,18 +21,18 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--check-every", type=int, default=10)
-    # Model size. SkeletalVAE is cheap relative to the triplane version --
-    # cost is dominated by cross-attention (linear in n_surface_points), not
-    # self-attention over it, so these can comfortably go higher than the
-    # triplane equivalents did on the same hardware.
+                                                                          
+                                                                            
+                                                                         
+                                                    
     p.add_argument("--embed-dim", type=int, default=128)
     p.add_argument("--latent-dim", type=int, default=64)
-    # Dataset sampling density -- the repo default of 81920 surface points is
-    # far too large for a free-tier GPU; a few thousand is plenty to start.
+                                                                             
+                                                                           
     p.add_argument("--n-surface-points", type=int, default=4096)
     p.add_argument("--n-query-points", type=int, default=2048)
-    # Effective batch size = batch_size * accum_steps, without the memory
-    # cost of a literally larger batch -- useful on a 4GB card.
+                                                                         
+                                                               
     p.add_argument("--accum-steps", type=int, default=4)
     p.add_argument("--checkpoint-every-steps", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
@@ -202,11 +182,7 @@ def compute_validation_metrics(model, val_loader, device, max_batches=3):
 
 
 def check_reconstruction(model, val_loader, device, epoch, resolution=48):
-    """
-    Decode one validation object's latent back to a mesh via marching cubes
-    and save it to disk so you can visually check whether the decoder is
-    learning actual object structure instead of a blob or a full volume.
-    """
+
     model.eval()
     batch = next(iter(val_loader))
     surface_xyz = batch["surface_xyz"][:1].to(device)

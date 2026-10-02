@@ -69,11 +69,11 @@ def main():
         collate_fn=latent_collate_fn,
     )
 
-    # Infer (n_tokens, latent_dim) from the actual cached latents rather than
-    # hardcoding SkeletalDiT's defaults -- those must match whatever
-    # train_vae.py's --embed-dim/--latent-dim actually was, and a silent
-    # mismatch here fails with a confusing matmul shape error instead of a
-    # clear one.
+                                                                             
+                                                                    
+                                                                        
+                                                                          
+                
     sample_latent = ds[0]["latent"]
     n_tokens, latent_dim = sample_latent.shape
     print(f"Inferred latent shape from cached data: n_tokens={n_tokens} latent_dim={latent_dim}")
@@ -123,7 +123,7 @@ def main():
             z0 = batch["latent"].to(DEVICE)
             bsz = z0.shape[0]
             t = torch.randint(0, TIMESTEPS, (bsz,), device=DEVICE)
-            a_t = alphas_cumprod[t].view(bsz, 1, 1)  # broadcasts over (n_tokens, latent_dim)
+            a_t = alphas_cumprod[t].view(bsz, 1, 1)                                          
             eps = torch.randn_like(z0)
             zt = torch.sqrt(a_t) * z0 + torch.sqrt(1 - a_t) * eps
 

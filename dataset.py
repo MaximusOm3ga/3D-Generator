@@ -1,17 +1,3 @@
-"""
-Stage 2b: the Dataset. Reads the .npz files prepare_data.py produced and
-turns each cached (mesh, skeleton) pair into the tensors SkeletalVAE.forward
-expects: surface_points, skeleton_points, query_points, occupancy_labels.
-
-Occupancy labels are generated fresh each time __getitem__ is called (cheap,
-and gives the model different query points every epoch instead of memorizing
-a fixed set) using the standard occupancy-network recipe: half the query
-points are uniform-random in the bounding volume, half are near-surface
-points perturbed with small noise -- near-surface points are what teach the
-decoder a sharp boundary; uniform points teach it "empty space" far away.
-
-pip install torch trimesh numpy --break-system-packages
-"""
 
 import os
 import glob
@@ -40,6 +26,7 @@ class SkeletalMeshDataset(Dataset):
         include_normals=True,
         include_fourier_features=True,
         fourier_bands=8,
+        include_occupancy=True,
     ):
         self.paths = sorted(glob.glob(os.path.join(cache_dir, "*.npz")))
         if len(self.paths) == 0:
@@ -52,6 +39,7 @@ class SkeletalMeshDataset(Dataset):
         self.include_normals = include_normals
         self.include_fourier_features = include_fourier_features
         self.fourier_bands = fourier_bands
+        self.include_occupancy = include_occupancy
 
     def __len__(self):
         return len(self.paths)
@@ -60,12 +48,12 @@ class SkeletalMeshDataset(Dataset):
         n_uniform = n_points // 2
         n_near = n_points - n_uniform
 
-        # Uniform points across the [-1, 1]^3 volume the mesh was normalized into.
+                                                                                  
         uniform_points = np.random.uniform(-1.0, 1.0, size=(n_uniform, 3))
 
-        # Near-surface points: sample the surface, then jitter off it slightly
-        # so the decoder sees both just-inside and just-outside examples near
-        # the boundary, which is where the actual shape detail lives.
+                                                                              
+                                                                             
+                                                                     
         surface_samples, _ = trimesh.sample.sample_surface(mesh, n_near)
         noise = np.random.normal(scale=self.near_surface_std, size=surface_samples.shape)
         near_points = surface_samples + noise
@@ -74,8 +62,8 @@ class SkeletalMeshDataset(Dataset):
             np.float32
         )
 
-        # contains() needs a watertight mesh -- prepare_data.py already
-        # guarantees this by discarding anything that fails the repair step.
+                                                                       
+                                                                            
         labels = mesh.contains(query_points).astype(np.float32)
 
         return query_points, labels
@@ -88,10 +76,12 @@ class SkeletalMeshDataset(Dataset):
 
         surface_points, face_idx = trimesh.sample.sample_surface(mesh, self.n_surface_points)
         face_normals = mesh.face_normals[face_idx].astype(np.float32)
-        query_points, occupancy_labels = self._sample_occupancy(
-            mesh, self.n_query_points
-        )
-        skeleton_points = data["skeleton_points"]  # already fixed-size from stage 1
+        query_points, occupancy_labels = None, None
+        if self.include_occupancy:
+            query_points, occupancy_labels = self._sample_occupancy(
+                mesh, self.n_query_points
+            )
+        skeleton_points = data["skeleton_points"]                                   
 
         surface_features = [surface_points.astype(np.float32)]
         if self.include_normals:
@@ -102,19 +92,21 @@ class SkeletalMeshDataset(Dataset):
             )
         surface_features = np.concatenate(surface_features, axis=-1).astype(np.float32)
 
-        return {
+        out = {
             "surface_points": torch.from_numpy(surface_features),
             "surface_xyz": torch.from_numpy(surface_points.astype(np.float32)),
             "skeleton_points": torch.from_numpy(skeleton_points.astype(np.float32)),
-            "query_points": torch.from_numpy(query_points),
-            "occupancy_labels": torch.from_numpy(occupancy_labels),
         }
+        if self.include_occupancy:
+            out["query_points"] = torch.from_numpy(query_points)
+            out["occupancy_labels"] = torch.from_numpy(occupancy_labels)
+        return out
 
 
 if __name__ == "__main__":
-    # Runs the labeling logic over every cached object, not just one -- a single
-    # good sample doesn't rule out other objects having a broken (non-watertight)
-    # mesh that makes contains() silently degenerate.
+                                                                                
+                                                                                 
+                                                     
     ds = SkeletalMeshDataset()
     print(f"Checking {len(ds)} cached objects...")
 
@@ -126,10 +118,10 @@ if __name__ == "__main__":
         frac = sample["occupancy_labels"].mean().item()
         fractions.append(frac)
 
-        # Exactly 0.0 or 1.0 across 4096 query points is effectively impossible
-        # for a real shape -- it means contains() returned the same label for
-        # every point, i.e. the mesh isn't actually watertight despite passing
-        # the repair step.
+                                                                               
+                                                                             
+                                                                              
+                          
         if frac <= 0.0 or frac >= 1.0:
             uid = os.path.basename(ds.paths[i]).replace(".npz", "")
             degenerate.append(uid)

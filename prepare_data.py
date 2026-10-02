@@ -8,7 +8,7 @@ from datasets import load_dataset
 
 N_SKELETON_POINTS = 256
 OUTPUT_DIR = "cached_objects"
-MAX_FACES = 5000  # decimate anything denser than this before repair/skeletonization
+MAX_FACES = 5000                                                                    
 
 
 def decimate_mesh(mesh, max_faces=MAX_FACES):
@@ -23,10 +23,10 @@ def decimate_mesh(mesh, max_faces=MAX_FACES):
     try:
         return mesh.simplify_quadric_decimation(face_count=max_faces)
     except Exception:
-        # The decimation backend can choke on pathological/degenerate input
-        # geometry (duplicate/zero-area triangles etc, common in scraped
-        # assets). Fall back to the full-resolution mesh rather than
-        # propagating -- slower for this one object, not a lost object.
+                                                                           
+                                                                        
+                                                                    
+                                                                       
         return mesh
 
 
@@ -131,7 +131,7 @@ def run(min_score=2, max_objects=2000):
 
     kept, skipped = 0, 0
     skip_reasons = {"repair_failed": 0, "skeleton_failed": 0, "exception": 0}
-    errors = []  # (uid, exception message) for anything unexpected
+    errors = []                                                    
 
     for uid, path in uid_to_path.items():
         if (kept + skipped) % 50 == 0:
@@ -139,8 +139,8 @@ def run(min_score=2, max_objects=2000):
 
         out_path = os.path.join(OUTPUT_DIR, f"{uid}.npz")
         if os.path.exists(out_path):
-            # Already processed in a previous run (e.g. one that crashed
-            # partway through) -- skip the expensive work and count it as kept.
+                                                                        
+                                                                               
             kept += 1
             continue
 
@@ -168,10 +168,10 @@ def run(min_score=2, max_objects=2000):
                 print(f"kept {kept} repaired objects so far", flush=True)
 
         except Exception as e:
-            # A single malformed mesh (bad decimation result, pymeshfix
-            # choking on pathological geometry, skeletor hitting an edge
-            # case) must never take down a multi-hour batch run over the
-            # other 299 objects -- log it and move on.
+                                                                       
+                                                                        
+                                                                        
+                                                      
             skipped += 1
             skip_reasons["exception"] += 1
             errors.append((uid, f"{type(e).__name__}: {e}"))
@@ -197,6 +197,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--min-score", type=int, default=2)
-    parser.add_argument("--max-objects", type=int, default=500)
+    parser.add_argument("--max-objects", type=int, default=3000)
     args = parser.parse_args()
     run(min_score=args.min_score, max_objects=args.max_objects)
