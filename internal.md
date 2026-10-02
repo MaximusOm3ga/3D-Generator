@@ -26,3 +26,12 @@ Data flow: manifest -> cached_objects -> VAE -> cached_latents (+ conditions) ->
 2.  python3 train_vae.py --n-surface-points 2048 --n-query-points 1024 --batch-size 1 --accum-steps 8 --amp
 3.  python3 encode_latents.py --vae-ckpt checkpoints/vae_best.pt --out-dir cached_latents
 4.  python3 train_dit.py --manifest data/manifest.jsonl --latent-dir cached_latents --condition-dir conditions --split train
+
+Resume commands:
+
+Validation:
+
+Python compilation passed.
+Atomic checkpoint round-trip passed.
+DiT CLI options verified.
+VAE CLI verification was blocked because the active Python environment lacks skimage; this is an existing environment dependency issue.
