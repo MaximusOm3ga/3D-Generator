@@ -28,6 +28,8 @@ Data flow: manifest -> cached_objects -> VAE -> cached_latents (+ conditions) ->
 4.  python3 train_dit.py --manifest data/manifest.jsonl --latent-dir cached_latents --condition-dir conditions --split train
 
 Resume commands:
+python train_vae.py --resume checkpoints/vae_last.pt
+python train_dit.py --manifest data/manifest.jsonl --latent-dir cached_latents --condition-dir conditions --split train --resume checkpoints/dit_last.pt
 
 Validation:
 
