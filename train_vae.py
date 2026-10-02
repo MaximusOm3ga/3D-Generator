@@ -54,7 +54,7 @@ def parse_args():
     # Effective batch size = batch_size * accum_steps, without the memory
     # cost of a literally larger batch -- useful on a 4GB card.
     p.add_argument("--accum-steps", type=int, default=4)
-    p.add_argument("--checkpoint-every-steps", type=int, default=25)
+    p.add_argument("--checkpoint-every-steps", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--amp", action="store_true", help="use mixed precision (torch.autocast)")
     p.add_argument(
