@@ -2,16 +2,19 @@
 Stage 2c: the actual training loop for the VAE.
 
 Run this after prepare_data.py has populated cached_objects/. This trains
-TriplaneLatentVAE (encoder) + TriplaneDecoder jointly on reconstruction.
+SkeletalVAE: a cross-attention encoder where each of the cached skeleton
+points is a query attending into the sampled surface point cloud, so every
+latent token is anchored to a specific location on the object's skeleton --
+plus its matching occupancy decoder. Jointly trained on reconstruction.
 Once val loss plateaus and reconstructions look right (see
 check_reconstruction below), freeze this model and move to encode_latents.py
 for DiT training -- that's a separate script, not this one.
 
-Defaults here are sized for a free Colab GPU (T4, 16GB) or a 4GB local card
-(GTX 1650), not the repo's original hidden_dim=768/latent_res=32/
-n_surface_points=81920 -- those OOM'd even in CPU-only testing. Pass
---hidden-dim / --latent-res / --n-surface-points / --n-query-points to scale
-up on a bigger GPU.
+Much cheaper than the triplane alternative (vae_model.TriplaneVAE, still in
+this repo if you want to switch back): the skeleton-query encoder only ever
+does CROSS-attention from a small, fixed 256-point query set into the surface
+points (cost linear in surface point count), never self-attention over the
+full surface point cloud the way TriplaneLatentVAE's point_blocks do.
 
 pip install torch trimesh numpy scikit-image --break-system-packages
 """
@@ -25,7 +28,7 @@ from skimage import measure
 import trimesh
 
 from dataset import SkeletalMeshDataset
-from vae_model import TriplaneVAE, vae_loss
+from vae_model import SkeletalVAE, vae_loss
 
 
 def parse_args():
@@ -37,12 +40,12 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--check-every", type=int, default=10)
-    # Model size -- kept small by default for 4-16GB GPUs. TriplaneLatentVAE's
-    # self-attention over the three planes costs O((3 * latent_res^2)^2), so
-    # latent_res is the single biggest lever on memory.
-    p.add_argument("--hidden-dim", type=int, default=128)
-    p.add_argument("--latent-channels", type=int, default=16)
-    p.add_argument("--latent-res", type=int, default=16)
+    # Model size. SkeletalVAE is cheap relative to the triplane version --
+    # cost is dominated by cross-attention (linear in n_surface_points), not
+    # self-attention over it, so these can comfortably go higher than the
+    # triplane equivalents did on the same hardware.
+    p.add_argument("--embed-dim", type=int, default=128)
+    p.add_argument("--latent-dim", type=int, default=64)
     # Dataset sampling density -- the repo default of 81920 surface points is
     # far too large for a free-tier GPU; a few thousand is plenty to start.
     p.add_argument("--n-surface-points", type=int, default=4096)
@@ -108,14 +111,14 @@ def run_epoch(model, loader, device, optimizer=None, scaler=None, use_amp=False,
         optimizer.zero_grad()
 
     for step, batch in enumerate(loader, start=1):
-        surface_features = batch["surface_points"].to(device)
         surface_xyz = batch["surface_xyz"].to(device)
+        skeleton_points = batch["skeleton_points"].to(device)
         query_points = batch["query_points"].to(device)
         labels = batch["occupancy_labels"].to(device)
 
         with torch.set_grad_enabled(is_train):
             with torch.autocast(device_type=device, enabled=(use_amp and device == "cuda")):
-                logits, mean, logvar = model(surface_features, surface_xyz, query_points)
+                logits, mean, logvar = model(surface_xyz, skeleton_points, query_points)
                 loss, recon, kl = vae_loss(logits, labels, mean, logvar)
 
         if is_train:
@@ -157,12 +160,12 @@ def compute_validation_metrics(model, val_loader, device, max_batches=3):
             if seen >= max_batches:
                 break
             seen += 1
-            surface_features = batch["surface_points"].to(device)
             surface_xyz = batch["surface_xyz"].to(device)
+            skeleton_points = batch["skeleton_points"].to(device)
             query_points = batch["query_points"].to(device)
             labels = batch["occupancy_labels"].to(device)
 
-            logits, mean, logvar = model(surface_features, surface_xyz, query_points)
+            logits, mean, logvar = model(surface_xyz, skeleton_points, query_points)
             probs = torch.sigmoid(logits)
             bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels).item()
             pred = (probs > 0.5).float()
@@ -186,11 +189,11 @@ def check_reconstruction(model, val_loader, device, epoch, resolution=48):
     """
     model.eval()
     batch = next(iter(val_loader))
-    surface_features = batch["surface_points"][:1].to(device)
     surface_xyz = batch["surface_xyz"][:1].to(device)
+    skeleton_points = batch["skeleton_points"][:1].to(device)
 
     with torch.no_grad():
-        mean, _ = model.encode(surface_features, surface_xyz)
+        mean, _ = model.encode(surface_xyz, skeleton_points)
 
         grid_coords = torch.linspace(-1, 1, resolution)
         grid = torch.stack(
@@ -229,11 +232,9 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     train_loader, val_loader = make_dataloaders(args)
 
-    model = TriplaneVAE(
-        in_channels=54,  # 3 xyz + 3 normals + 48 fourier -- must match dataset.py
-        hidden_dim=args.hidden_dim,
-        latent_channels=args.latent_channels,
-        latent_res=args.latent_res,
+    model = SkeletalVAE(
+        embed_dim=args.embed_dim,
+        latent_dim=args.latent_dim,
     ).to(device)
 
     start_epoch = 1

@@ -111,12 +111,15 @@ class SkeletalVAE(nn.Module):
         self.encoder = SkeletonQueryEncoder(embed_dim=embed_dim, latent_dim=latent_dim)
         self.decoder = OccupancyDecoder(latent_dim=latent_dim, embed_dim=embed_dim)
 
+    def encode(self, surface_points, skeleton_points):
+        return self.encoder(surface_points, skeleton_points)
+
     def reparameterize(self, mean, logvar):
         std = torch.exp(0.5 * logvar)
         return mean + std * torch.randn_like(std)
 
     def forward(self, surface_points, skeleton_points, query_points):
-        mean, logvar = self.encoder(surface_points, skeleton_points)
+        mean, logvar = self.encode(surface_points, skeleton_points)
         latent_tokens = self.reparameterize(mean, logvar)
         occupancy_logits = self.decoder(query_points, latent_tokens)
         return occupancy_logits, mean, logvar

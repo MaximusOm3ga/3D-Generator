@@ -40,6 +40,50 @@ class DiTBlock(nn.Module):
         return x
 
 
+class SkeletalDiT(nn.Module):
+    """
+    DiT for SkeletalVAE's latent: a flat (B, N_tokens, latent_dim) sequence
+    already (256 skeleton-anchored tokens by default) -- no reshape into a
+    (3, R, R, C) grid needed the way TriplaneDiT requires, since the latent
+    is already sequence-shaped coming out of the VAE.
+    """
+
+    def __init__(self, n_tokens=256, latent_dim=64, width=256, depth=6, heads=8, cond_dim=256):
+        super().__init__()
+        self.n_tokens = n_tokens
+        self.latent_dim = latent_dim
+        self.in_proj = nn.Linear(latent_dim, width)
+        self.t_proj = nn.Sequential(
+            nn.Linear(width, width),
+            nn.SiLU(),
+            nn.Linear(width, width),
+        )
+        self.cond_proj = nn.Linear(cond_dim, width)
+        self.blocks = nn.ModuleList([DiTBlock(width=width, heads=heads) for _ in range(depth)])
+        self.out_norm = nn.LayerNorm(width)
+        self.out_proj = nn.Linear(width, latent_dim)
+
+    def forward(self, z_noisy, timesteps, clip_tokens=None, dino_tokens=None):
+        # z_noisy: (B, n_tokens, latent_dim) -- already flat, nothing to reshape
+        x = self.in_proj(z_noisy)
+
+        t_emb = timestep_embedding(timesteps, x.shape[-1])
+        x = x + self.t_proj(t_emb).unsqueeze(1)
+
+        cross_tokens = []
+        if clip_tokens is not None:
+            cross_tokens.append(self.cond_proj(clip_tokens))
+        if dino_tokens is not None:
+            cross_tokens.append(self.cond_proj(dino_tokens))
+        cross = torch.cat(cross_tokens, dim=1) if cross_tokens else None
+
+        for block in self.blocks:
+            x = block(x, cross_tokens=cross)
+
+        pred = self.out_proj(self.out_norm(x))
+        return pred  # (B, n_tokens, latent_dim) -- same shape as z_noisy, no reshape back
+
+
 class TriplaneDiT(nn.Module):
     def __init__(self, latent_channels=16, latent_res=32, width=768, depth=12, heads=12, cond_dim=256):
         super().__init__()

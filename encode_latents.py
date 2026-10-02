@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import SkeletalMeshDataset
-from vae_model import TriplaneVAE
+from vae_model import SkeletalVAE
 
 
 def parse_args():
@@ -23,12 +23,11 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     checkpoint = torch.load(args.vae_ckpt, map_location=device)
-    # train_vae.py now saves {"model_state": ..., "epoch": ..., "args": ...}
-    # rather than a bare state dict -- unwrap it, and read the architecture
-    # config (hidden_dim/latent_channels/latent_res) back out of it so this
-    # script can't silently mismatch what was actually trained. Falls back
-    # to TriplaneVAE's defaults only for an older bare-state-dict checkpoint
-    # that predates this change.
+    # train_vae.py saves {"model_state": ..., "epoch": ..., "args": ...} --
+    # unwrap it, and read the architecture config (embed_dim/latent_dim) back
+    # out of it so this script can't silently mismatch what was actually
+    # trained. Falls back to SkeletalVAE's defaults only for an older
+    # bare-state-dict checkpoint that predates this change.
     if "model_state" in checkpoint:
         state = checkpoint["model_state"]
         train_args = checkpoint.get("args", {})
@@ -36,11 +35,9 @@ def main():
         state = checkpoint
         train_args = {}
 
-    model = TriplaneVAE(
-        in_channels=54,
-        hidden_dim=train_args.get("hidden_dim", 128),
-        latent_channels=train_args.get("latent_channels", 16),
-        latent_res=train_args.get("latent_res", 16),
+    model = SkeletalVAE(
+        embed_dim=train_args.get("embed_dim", 128),
+        latent_dim=train_args.get("latent_dim", 64),
     ).to(device)
     model.load_state_dict(state, strict=True)
     model.eval()
@@ -51,14 +48,14 @@ def main():
         cache_dir=args.cache_dir,
         n_surface_points=train_args.get("n_surface_points", 4096),
     )
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     offset = 0
     with torch.no_grad():
         for step, batch in enumerate(loader, start=1):
-            surface = batch["surface_points"].to(device)
             xyz = batch["surface_xyz"].to(device)
-            mean, _ = model.encode(surface, xyz)
+            skeleton_points = batch["skeleton_points"].to(device)
+            mean, _ = model.encode(xyz, skeleton_points)
             latents = mean.cpu().numpy()
 
             for i in range(latents.shape[0]):
