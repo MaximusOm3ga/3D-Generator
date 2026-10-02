@@ -29,6 +29,7 @@ import trimesh
 
 from dataset import SkeletalMeshDataset
 from vae_model import SkeletalVAE, vae_loss
+from checkpoint_utils import atomic_torch_save, capture_rng_state, restore_rng_state
 
 
 def parse_args():
@@ -53,6 +54,8 @@ def parse_args():
     # Effective batch size = batch_size * accum_steps, without the memory
     # cost of a literally larger batch -- useful on a 4GB card.
     p.add_argument("--accum-steps", type=int, default=4)
+    p.add_argument("--checkpoint-every-steps", type=int, default=25)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--amp", action="store_true", help="use mixed precision (torch.autocast)")
     p.add_argument(
         "--num-workers",
@@ -83,11 +86,14 @@ def make_dataloaders(args):
             f"({args.batch_size}) -- reducing to {effective_batch_size} for this run"
         )
 
-    train_set, val_set = random_split(full_dataset, [n_train, n_val])
+    split_generator = torch.Generator().manual_seed(args.seed)
+    train_set, val_set = random_split(
+        full_dataset, [n_train, n_val], generator=split_generator
+    )
     train_loader = DataLoader(
         train_set,
         batch_size=effective_batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=args.num_workers,
         drop_last=False,
     )
@@ -100,7 +106,17 @@ def make_dataloaders(args):
     return train_loader, val_loader
 
 
-def run_epoch(model, loader, device, optimizer=None, scaler=None, use_amp=False, accum_steps=1):
+def run_epoch(
+    model,
+    loader,
+    device,
+    optimizer=None,
+    scaler=None,
+    use_amp=False,
+    accum_steps=1,
+    start_step=0,
+    checkpoint_callback=None,
+):
     """optimizer=None runs a validation pass instead of a training pass."""
     is_train = optimizer is not None
     model.train(is_train)
@@ -111,6 +127,8 @@ def run_epoch(model, loader, device, optimizer=None, scaler=None, use_amp=False,
         optimizer.zero_grad()
 
     for step, batch in enumerate(loader, start=1):
+        if is_train and step <= start_step:
+            continue
         surface_xyz = batch["surface_xyz"].to(device)
         skeleton_points = batch["skeleton_points"].to(device)
         query_points = batch["query_points"].to(device)
@@ -135,6 +153,8 @@ def run_epoch(model, loader, device, optimizer=None, scaler=None, use_amp=False,
                 else:
                     optimizer.step()
                 optimizer.zero_grad()
+                if checkpoint_callback is not None:
+                    checkpoint_callback(step)
 
         total_loss += loss.item()
         total_recon += recon.item()
@@ -241,19 +261,59 @@ def main():
     best_val_loss = float("inf")
     if args.resume and os.path.exists(args.resume):
         print(f"Resuming from {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model_state"])
-        start_epoch = checkpoint.get("epoch", 0) + 1
+        start_epoch = checkpoint.get("epoch", 0)
+        if checkpoint.get("batch_step", 0) == 0:
+            start_epoch += 1
+        resume_step = checkpoint.get("batch_step", 0)
         best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+    else:
+        checkpoint = None
+        resume_step = 0
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=(args.amp and device == "cuda"))
+    if checkpoint is not None:
+        if checkpoint.get("optimizer_state"):
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+        if checkpoint.get("scaler_state"):
+            scaler.load_state_dict(checkpoint["scaler_state"])
+        restore_rng_state(checkpoint.get("rng_state"))
+
+    def save_checkpoint(epoch, batch_step, best_loss):
+        atomic_torch_save(
+            {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scaler_state": scaler.state_dict(),
+                "epoch": epoch,
+                "batch_step": batch_step,
+                "best_val_loss": best_loss,
+                "args": vars(args),
+                "rng_state": capture_rng_state(),
+            },
+            os.path.join(args.checkpoint_dir, "vae_last.pt"),
+        )
 
     for epoch in range(start_epoch, args.epochs + 1):
         print(f"starting epoch {epoch}/{args.epochs}", flush=True)
         train_loss, train_recon, train_kl = run_epoch(
-            model, train_loader, device, optimizer, scaler, args.amp, args.accum_steps
+            model,
+            train_loader,
+            device,
+            optimizer,
+            scaler,
+            args.amp,
+            args.accum_steps,
+            start_step=resume_step if epoch == start_epoch else 0,
+            checkpoint_callback=lambda step: (
+                save_checkpoint(epoch, step, best_val_loss)
+                if step % args.checkpoint_every_steps == 0
+                else None
+            ),
         )
+        resume_step = 0
         val_loss, val_recon, val_kl = run_epoch(model, val_loader, device)
         val_metrics = compute_validation_metrics(model, val_loader, device)
 
@@ -267,16 +327,20 @@ def main():
 
         checkpoint = {
             "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scaler_state": scaler.state_dict(),
             "epoch": epoch,
+            "batch_step": 0,
             "best_val_loss": best_val_loss,
             "args": vars(args),
+            "rng_state": capture_rng_state(),
         }
-        torch.save(checkpoint, os.path.join(args.checkpoint_dir, "vae_last.pt"))
+        atomic_torch_save(checkpoint, os.path.join(args.checkpoint_dir, "vae_last.pt"))
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             checkpoint["best_val_loss"] = best_val_loss
-            torch.save(checkpoint, os.path.join(args.checkpoint_dir, "vae_best.pt"))
+            atomic_torch_save(checkpoint, os.path.join(args.checkpoint_dir, "vae_best.pt"))
 
         if epoch % args.check_every == 0:
             check_reconstruction(model, val_loader, device, epoch)

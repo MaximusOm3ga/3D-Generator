@@ -8,12 +8,16 @@ Prepare meshes/skeletons
 3.
 Train the VAE
    python3 train_vae.py
+   Resume after a stop or OOM:
+   python3 train_vae.py --resume checkpoints/vae_last.pt
 4.
 Freeze + encode latents
    python3 encode_latents.py --vae-ckpt checkpoints/vae_best.pt --out-dir cached_latents
 5.
 Train the DiT
    python3 train_dit.py --manifest data/manifest.jsonl --latent-dir cached_latents --condition-dir conditions --split train
+   Resume after a stop or OOM:
+   python3 train_dit.py --manifest data/manifest.jsonl --latent-dir cached_latents --condition-dir conditions --split train --resume checkpoints/dit_last.pt
 6.
 Sample a latent and decode to mesh
 ◦
