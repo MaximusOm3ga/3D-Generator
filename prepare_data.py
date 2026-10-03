@@ -9,29 +9,28 @@ from datasets import load_dataset
 
 N_SKELETON_POINTS = 256
 OUTPUT_DIR = "cached_objects"
-MAX_FACES = 5000                                                                    
+MAX_FACES = 5000
 
 
 def decimate_mesh(mesh, max_faces=MAX_FACES):
-    """
-    Cap face count before the expensive steps. Both pymeshfix's repair() and
-    skeletor's by_wavefront scale with mesh complexity, and Objaverse assets
-    vary wildly -- a few hundred faces to hundreds of thousands. Without this,
-    a handful of dense objects in a batch can dominate the whole run's time.
-    """
+
     if len(mesh.faces) <= max_faces:
         return mesh
     try:
         return mesh.simplify_quadric_decimation(face_count=max_faces)
     except Exception:
-                                                                           
-                                                                        
-                                                                    
-                                                                       
+
         return mesh
 
 
-def load_filtered_uids(min_score=2, max_objects=2000):
+def list_lvis_categories():
+
+    lvis = objaverse.load_lvis_annotations()
+    return sorted(lvis.keys())
+
+
+def load_filtered_uids(min_score=1.2, max_objects=2000, category=None):
+
     ds = load_dataset("cindyxl/ObjaversePlusPlus", split="train")
     df = ds.to_pandas()
     bool_map = {"true": True, "false": False, True: True, False: False}
@@ -44,14 +43,28 @@ def load_filtered_uids(min_score=2, max_objects=2000):
     )
 
     mask = (
-        (df["score"] >= min_score)
-        & (~is_scene)
-        & (~is_multi)
-        & (~is_transparent)
+            (df["score"] >= min_score)
+            & (~is_scene)
+            & (~is_multi)
+            & (~is_transparent)
     )
+
+    if category is not None:
+        lvis = objaverse.load_lvis_annotations()
+        if category not in lvis:
+            raise ValueError(
+                f"'{category}' is not a known LVIS category. "
+                f"Call list_lvis_categories() to see valid names "
+                f"(e.g. 'chair', 'guitar', 'car')."
+            )
+        category_uids = set(lvis[category])
+        mask = mask & df["UID"].isin(category_uids)
+        print(f"Category '{category}': {len(category_uids)} objects in LVIS before quality filtering")
+
     filtered = df[mask]
     uids = filtered["UID"].tolist()[:max_objects]
-    print(f"Filtered {len(filtered)} objects (score>={min_score}); using {len(uids)}")
+    category_note = f" category='{category}'" if category else ""
+    print(f"Filtered {len(filtered)} objects (score>={min_score}{category_note}); using {len(uids)}")
     return uids
 
 
@@ -125,14 +138,14 @@ def farthest_point_sample(points, n_points):
     return sampled.astype(np.float32)
 
 
-def run(min_score=2, max_objects=2000):
+def run(min_score=2, max_objects=2000, category=None):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    uids = load_filtered_uids(min_score=min_score, max_objects=max_objects)
+    uids = load_filtered_uids(min_score=min_score, max_objects=max_objects, category=category)
     uid_to_path = download_meshes(uids)
 
     kept, skipped = 0, 0
     skip_reasons = {"repair_failed": 0, "skeleton_failed": 0, "exception": 0}
-    errors = []                                                    
+    errors = []
 
     for uid, path in uid_to_path.items():
         obj_start = time.time()
@@ -142,8 +155,6 @@ def run(min_score=2, max_objects=2000):
 
         out_path = os.path.join(OUTPUT_DIR, f"{uid}.npz")
         if os.path.exists(out_path):
-                                                                        
-                                                                               
             kept += 1
             elapsed = time.time() - obj_start
             print(f"done uid={uid} status=cache_hit elapsed={elapsed:.2f}s", flush=True)
@@ -179,10 +190,7 @@ def run(min_score=2, max_objects=2000):
             print(f"done uid={uid} status=kept elapsed={elapsed:.2f}s", flush=True)
 
         except Exception as e:
-                                                                       
-                                                                        
-                                                                        
-                                                      
+
             skipped += 1
             skip_reasons["exception"] += 1
             errors.append((uid, f"{type(e).__name__}: {e}"))
@@ -209,7 +217,24 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--min-score", type=int, default=2)
+    parser.add_argument("--min-score", type=int, default=1.2)
     parser.add_argument("--max-objects", type=int, default=3000)
+    parser.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        help="Restrict to one LVIS category (e.g. 'chair', 'car'). "
+             "Omit to pull from all categories, as before.",
+    )
+    parser.add_argument(
+        "--list-categories",
+        action="store_true",
+        help="Print all valid --category names and exit, without downloading anything.",
+    )
     args = parser.parse_args()
-    run(min_score=args.min_score, max_objects=args.max_objects)
+
+    if args.list_categories:
+        for name in list_lvis_categories():
+            print(name)
+    else:
+        run(min_score=args.min_score, max_objects=args.max_objects, category=args.category)

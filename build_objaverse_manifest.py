@@ -5,6 +5,7 @@ import sys
 from typing import Dict, List
 
 from datasets import load_dataset
+import objaverse
 
 
 def _to_bool(v):
@@ -36,6 +37,13 @@ def parse_args():
     p.add_argument("--test-ratio", type=float, default=0.05)
     p.add_argument("--image-root", type=str, default="images")
     p.add_argument("--default-view", type=str, default="view_00.png")
+    p.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        help="Restrict to one LVIS category (e.g. 'chair', 'car'), same as "
+        "prepare_data.py --category. Omit for all categories.",
+    )
     return p.parse_args()
 
 
@@ -44,8 +52,20 @@ def main():
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
     ds = load_dataset("cindyxl/ObjaversePlusPlus", split="train")
+
+    category_uids = None
+    if args.category is not None:
+        lvis = objaverse.load_lvis_annotations()
+        if args.category not in lvis:
+            print(f"'{args.category}' is not a known LVIS category.", file=sys.stderr)
+            sys.exit(1)
+        category_uids = set(lvis[args.category])
+        print(f"Category '{args.category}': {len(category_uids)} objects in LVIS")
+
     rows: List[Dict] = []
     for r in ds:
+        if category_uids is not None and r.get("UID") not in category_uids:
+            continue
         score = r.get("score", -1)
         if score is None or score < args.min_score:
             continue
