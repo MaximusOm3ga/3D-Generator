@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import trimesh
 import pymeshfix
@@ -134,6 +135,8 @@ def run(min_score=2, max_objects=2000):
     errors = []                                                    
 
     for uid, path in uid_to_path.items():
+        obj_start = time.time()
+        print(f"start uid={uid}", flush=True)
         if (kept + skipped) % 50 == 0:
             print(f"processed {kept + skipped}/{len(uid_to_path)} objects...", flush=True)
 
@@ -142,6 +145,8 @@ def run(min_score=2, max_objects=2000):
                                                                         
                                                                                
             kept += 1
+            elapsed = time.time() - obj_start
+            print(f"done uid={uid} status=cache_hit elapsed={elapsed:.2f}s", flush=True)
             continue
 
         try:
@@ -149,12 +154,16 @@ def run(min_score=2, max_objects=2000):
             if mesh is None:
                 skipped += 1
                 skip_reasons["repair_failed"] += 1
+                elapsed = time.time() - obj_start
+                print(f"done uid={uid} status=repair_failed elapsed={elapsed:.2f}s", flush=True)
                 continue
 
             skel_points = extract_skeleton_points(mesh)
             if skel_points is None:
                 skipped += 1
                 skip_reasons["skeleton_failed"] += 1
+                elapsed = time.time() - obj_start
+                print(f"done uid={uid} status=skeleton_failed elapsed={elapsed:.2f}s", flush=True)
                 continue
 
             np.savez(
@@ -166,6 +175,8 @@ def run(min_score=2, max_objects=2000):
             kept += 1
             if kept % 50 == 0:
                 print(f"kept {kept} repaired objects so far", flush=True)
+            elapsed = time.time() - obj_start
+            print(f"done uid={uid} status=kept elapsed={elapsed:.2f}s", flush=True)
 
         except Exception as e:
                                                                        
@@ -175,6 +186,8 @@ def run(min_score=2, max_objects=2000):
             skipped += 1
             skip_reasons["exception"] += 1
             errors.append((uid, f"{type(e).__name__}: {e}"))
+            elapsed = time.time() - obj_start
+            print(f"done uid={uid} status=exception elapsed={elapsed:.2f}s", flush=True)
             print(f"  {uid}: unhandled exception, skipping ({type(e).__name__}: {e})", flush=True)
 
     print(f"Done. kept={kept} skipped={skipped}")
