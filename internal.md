@@ -39,6 +39,17 @@ Atomic checkpoint round-trip passed.
 DiT CLI options verified.
 VAE CLI verification was blocked because the active Python environment lacks skimage; this is an existing environment dependency issue.
 
+
+Low mem train VAE 
+python3 train_dit.py \
+  --manifest data/manifest_from_cached_latents.jsonl \
+  --latent-dir cached_latents \
+  --condition-dir conditions \
+  --split train \
+  --batch-size 1 \
+  --checkpoint-every-steps 100
+
+
 python3 sample_dit.py   --dit-ckpt checkpoints/dit_last.pt   --vae-ckpt checkpoints/vae_best.pt   --out-dir samples   --num-samples 4   --cfg-scale 1.0   --resolution 64
 
 python render_obj.py samples/sample_001.obj --out sample_001.png

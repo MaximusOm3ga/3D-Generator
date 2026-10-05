@@ -67,7 +67,7 @@ def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps,
     step_indices = torch.linspace(timesteps - 1, 0, steps=sampling_steps, device=device).long().unique()
     step_indices = step_indices.flip(0)
 
-    for t_idx in step_indices:
+    for i, t_idx in enumerate(step_indices):
         t = torch.full((shape[0],), int(t_idx.item()), device=device, dtype=torch.long)
 
         eps_cond = dit(z, t, clip_tokens=clip_tokens, dino_tokens=dino_tokens)
@@ -77,12 +77,17 @@ def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps,
         else:
             eps = eps_cond
 
-        a_t = alphas[t].view(-1, 1, 1)
         ab_t = alphas_cumprod[t].view(-1, 1, 1)
 
         z0_hat = (z - torch.sqrt(1 - ab_t) * eps) / torch.sqrt(ab_t)
 
-        t_prev = torch.clamp(t - max(timesteps // sampling_steps, 1), min=0)
+        # Use the ACTUAL next step in the respaced schedule, not an averaged
+        # fixed stride -- these only coincide when sampling_steps == timesteps.
+        if i + 1 < len(step_indices):
+            t_prev_val = int(step_indices[i + 1].item())
+        else:
+            t_prev_val = 0
+        t_prev = torch.full((shape[0],), t_prev_val, device=device, dtype=torch.long)
         ab_prev = alphas_cumprod[t_prev].view(-1, 1, 1)
 
         if int(t_idx.item()) > 0:
@@ -100,8 +105,17 @@ def decode_to_mesh(vae, latent_tokens, device, resolution=64, threshold=0.5):
         torch.meshgrid(grid_coords, grid_coords, grid_coords, indexing="ij"), dim=-1
     ).reshape(1, -1, 3)
 
-    logits = vae.decoder(grid, latent_tokens)            
+    logits = vae.decoder(grid, latent_tokens)
     occ = torch.sigmoid(logits).reshape(resolution, resolution, resolution).cpu().numpy()
+
+    vmin = float(occ.min())
+    vmax = float(occ.max())
+    if not (vmin < threshold < vmax):
+        threshold = float(np.quantile(occ, 0.5))
+    if not (vmin < threshold < vmax):
+        threshold = 0.5 * (vmin + vmax)
+    if not (vmin < threshold < vmax):
+        raise RuntimeError(f"Degenerate occupancy field: min={vmin:.6f}, max={vmax:.6f}")
 
     verts, faces, _, _ = measure.marching_cubes(occ, level=threshold)
     scale = 2.0 / (resolution - 1)

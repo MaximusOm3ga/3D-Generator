@@ -6,6 +6,12 @@ import numpy as np
 import torch
 
 
+def _to_cpu_byte_tensor(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(dtype=torch.uint8, device="cpu")
+    return torch.tensor(value, dtype=torch.uint8, device="cpu")
+
+
 def capture_rng_state():
     state = {
         "python": random.getstate(),
@@ -22,9 +28,13 @@ def restore_rng_state(state):
         return
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+    torch.set_rng_state(_to_cpu_byte_tensor(state["torch"]))
     if torch.cuda.is_available() and "cuda" in state:
-        torch.cuda.set_rng_state_all(state["cuda"])
+        cuda_states = state["cuda"]
+        if isinstance(cuda_states, (list, tuple)):
+            torch.cuda.set_rng_state_all([_to_cpu_byte_tensor(s) for s in cuda_states])
+        else:
+            torch.cuda.set_rng_state_all([_to_cpu_byte_tensor(cuda_states)])
 
 
 def atomic_torch_save(payload, path):
