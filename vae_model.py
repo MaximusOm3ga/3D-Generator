@@ -291,9 +291,19 @@ class TriplaneVAE(nn.Module):
         return occupancy_logits, mean, logvar
 
 
-def vae_loss(occupancy_logits, occupancy_labels, mean, logvar, kl_weight=1e-4):
+def vae_loss(occupancy_logits, occupancy_labels, mean, logvar, kl_weight=1e-4, pos_weight=None):
+    """
+    pos_weight: scalar tensor upweighting "inside" (label=1) examples in the
+    BCE loss. Without this, thin/sparse shapes (airplanes, chairs with lots
+    of empty space in their bounding box) let the model trivially minimize
+    loss by always predicting "empty" everywhere -- a real degenerate
+    minimum, not a training-time artifact, and one plain BCE will happily
+    converge to given enough epochs. Compute from each batch's actual
+    negative:positive ratio (see train_vae.py) so it adapts automatically
+    rather than needing a fixed hyperparameter per dataset/category.
+    """
     recon_loss = nn.functional.binary_cross_entropy_with_logits(
-        occupancy_logits, occupancy_labels
+        occupancy_logits, occupancy_labels, pos_weight=pos_weight
     )
     kl_loss = -0.5 * torch.mean(1 + logvar - mean.pow(2) - logvar.exp())
     return recon_loss + kl_weight * kl_loss, recon_loss, kl_loss

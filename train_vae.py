@@ -1,4 +1,3 @@
-
 import argparse
 import os
 import numpy as np
@@ -21,18 +20,13 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--check-every", type=int, default=10)
-                                                                          
-                                                                            
-                                                                         
-                                                    
+
     p.add_argument("--embed-dim", type=int, default=128)
     p.add_argument("--latent-dim", type=int, default=64)
-                                                                             
-                                                                           
+
     p.add_argument("--n-surface-points", type=int, default=4096)
     p.add_argument("--n-query-points", type=int, default=2048)
-                                                                         
-                                                               
+
     p.add_argument("--accum-steps", type=int, default=4)
     p.add_argument("--checkpoint-every-steps", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
@@ -42,9 +36,9 @@ def parse_args():
         type=int,
         default=0,
         help="DataLoader worker processes. Default 0 (main-process loading) because "
-        "Colab's small /dev/shm can cause workers to be silently killed once "
-        "PyTorch's shared-memory tensor buffers fill up -- raise this only if "
-        "you've confirmed your environment's /dev/shm can handle it.",
+             "Colab's small /dev/shm can cause workers to be silently killed once "
+             "PyTorch's shared-memory tensor buffers fill up -- raise this only if "
+             "you've confirmed your environment's /dev/shm can handle it.",
     )
     return p.parse_args()
 
@@ -87,15 +81,15 @@ def make_dataloaders(args):
 
 
 def run_epoch(
-    model,
-    loader,
-    device,
-    optimizer=None,
-    scaler=None,
-    use_amp=False,
-    accum_steps=1,
-    start_step=0,
-    checkpoint_callback=None,
+        model,
+        loader,
+        device,
+        optimizer=None,
+        scaler=None,
+        use_amp=False,
+        accum_steps=1,
+        start_step=0,
+        checkpoint_callback=None,
 ):
     """optimizer=None runs a validation pass instead of a training pass."""
     is_train = optimizer is not None
@@ -117,7 +111,15 @@ def run_epoch(
         with torch.set_grad_enabled(is_train):
             with torch.autocast(device_type=device, enabled=(use_amp and device == "cuda")):
                 logits, mean, logvar = model(surface_xyz, skeleton_points, query_points)
-                loss, recon, kl = vae_loss(logits, labels, mean, logvar)
+                # Reweight for class imbalance: thin/sparse shapes (airplanes
+                # especially) have far more "empty" than "inside" query points,
+                # which otherwise lets the model collapse to always predicting
+                # empty -- a real degenerate minimum, confirmed by
+                # std_prob=0.000 after 185 real epochs without this fix.
+                n_pos = labels.sum().clamp(min=1.0)
+                n_neg = (labels.numel() - labels.sum()).clamp(min=1.0)
+                pos_weight = (n_neg / n_pos).detach()
+                loss, recon, kl = vae_loss(logits, labels, mean, logvar, pos_weight=pos_weight)
 
         if is_train:
             scaled_loss = loss / accum_steps
@@ -182,7 +184,6 @@ def compute_validation_metrics(model, val_loader, device, max_batches=3):
 
 
 def check_reconstruction(model, val_loader, device, epoch, resolution=48):
-
     model.eval()
     batch = next(iter(val_loader))
     surface_xyz = batch["surface_xyz"][:1].to(device)
@@ -204,7 +205,8 @@ def check_reconstruction(model, val_loader, device, epoch, resolution=48):
     occupied_fraction = float(np.mean(occupancy_np > 0.5))
     print(
         f"  reconstruction check: occupied_fraction={occupied_fraction:.3f}, "
-        f"mean_prob={occupancy_np.mean():.3f}, std_prob={occupancy_np.std():.3f}",
+        f"mean_prob={occupancy_np.mean():.6f}, std_prob={occupancy_np.std():.6f}, "
+        f"min_prob={occupancy_np.min():.6f}, max_prob={occupancy_np.max():.6f}",
         flush=True,
     )
 
