@@ -1,3 +1,4 @@
+import glob
 import json
 import os
 from typing import Any, Dict, List, Optional
@@ -23,6 +24,36 @@ def load_manifest(manifest_path: str, split: Optional[str] = None) -> List[Dict[
     return rows
 
 
+def build_manifest_from_latent_dir(
+    latent_dir: str,
+    split: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    latent_paths = sorted(glob.glob(os.path.join(latent_dir, "*.npz")))
+    if not latent_paths:
+        raise RuntimeError(f"No latent .npz files found in {latent_dir}")
+
+    rows: List[Dict[str, Any]] = []
+    for path in latent_paths:
+        uid = os.path.basename(path).replace(".npz", "")
+        inferred_split = None
+        if "_train_" in uid:
+            inferred_split = "train"
+        elif "_test_" in uid:
+            inferred_split = "test"
+
+        row_split = inferred_split or "train"
+        if split is not None and row_split != split:
+            continue
+
+        rows.append({"uid": uid, "split": row_split, "source": "modelnet40-local"})
+
+    if not rows:
+        raise RuntimeError(
+            f"No latent entries found in {latent_dir} for split={split}"
+        )
+    return rows
+
+
 class LatentTriplaneDataset(Dataset):
     def __init__(
         self,
@@ -31,7 +62,10 @@ class LatentTriplaneDataset(Dataset):
         condition_dir: Optional[str] = "conditions",
         split: Optional[str] = None,
     ):
-        self.items = load_manifest(manifest_path, split=split)
+        if manifest_path and os.path.exists(manifest_path):
+            self.items = load_manifest(manifest_path, split=split)
+        else:
+            self.items = build_manifest_from_latent_dir(latent_dir, split=split)
         self.latent_dir = latent_dir
         self.condition_dir = condition_dir
 

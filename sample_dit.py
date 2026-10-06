@@ -38,6 +38,12 @@ def parse_args():
     p.add_argument("--resolution", type=int, default=64,
                    help="Marching-cubes occupancy grid resolution.")
     p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument(
+        "--decode-batch-points",
+        type=int,
+        default=32768,
+        help="Number of query points decoded per chunk to reduce VRAM use.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -123,6 +129,46 @@ def decode_to_mesh(vae, latent_tokens, device, resolution=64, threshold=0.5):
     return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
 
 
+@torch.no_grad()
+def decode_to_mesh_chunked(
+    vae,
+    latent_tokens,
+    device,
+    resolution=64,
+    threshold=0.5,
+    decode_batch_points=32768,
+):
+    grid_coords = torch.linspace(-1, 1, resolution, device=device)
+    grid = torch.stack(
+        torch.meshgrid(grid_coords, grid_coords, grid_coords, indexing="ij"), dim=-1
+    ).reshape(1, -1, 3)
+
+    total_points = grid.shape[1]
+    logits_parts = []
+    for start in range(0, total_points, decode_batch_points):
+        end = min(start + decode_batch_points, total_points)
+        grid_chunk = grid[:, start:end, :]
+        logits_chunk = vae.decoder(grid_chunk, latent_tokens)
+        logits_parts.append(logits_chunk)
+    logits = torch.cat(logits_parts, dim=1)
+
+    occ = torch.sigmoid(logits).reshape(resolution, resolution, resolution).cpu().numpy()
+
+    vmin = float(occ.min())
+    vmax = float(occ.max())
+    if not (vmin < threshold < vmax):
+        threshold = float(np.quantile(occ, 0.5))
+    if not (vmin < threshold < vmax):
+        threshold = 0.5 * (vmin + vmax)
+    if not (vmin < threshold < vmax):
+        raise RuntimeError(f"Degenerate occupancy field: min={vmin:.6f}, max={vmax:.6f}")
+
+    verts, faces, _, _ = measure.marching_cubes(occ, level=threshold)
+    scale = 2.0 / (resolution - 1)
+    verts = verts * scale - 1.0
+    return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -168,12 +214,13 @@ def main():
             dino_tokens=dino_tokens,
             cfg_scale=args.cfg_scale,
         )
-        mesh = decode_to_mesh(
+        mesh = decode_to_mesh_chunked(
             vae=vae,
             latent_tokens=latent,
             device=device,
             resolution=args.resolution,
             threshold=args.threshold,
+            decode_batch_points=args.decode_batch_points,
         )
         out_path = os.path.join(args.out_dir, f"sample_{i:03d}.obj")
         mesh.export(out_path)
