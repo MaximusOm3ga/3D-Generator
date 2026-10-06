@@ -19,7 +19,7 @@ Run flow now:
     ◦
     The current pieces already cover training and data wiring; sampling is the next missing step.
 
-Data flow: cached_objects (ModelNet40 category) -> VAE -> cached_latents (+ conditions) -> DiT -> decoder -> mesh.
+Data flow: cached_objects (ModelNet40 category) → VAE → cached_latents (+ conditions) → DiT → decoder → mesh.
 
 1.  python3 prepare_data.py
 2.  python3 train_vae.py --n-surface-points 2048 --n-query-points 1024 --batch-size 1 --accum-steps 8 --amp

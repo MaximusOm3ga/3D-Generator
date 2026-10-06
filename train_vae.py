@@ -23,6 +23,16 @@ def parse_args():
 
     p.add_argument("--embed-dim", type=int, default=128)
     p.add_argument("--latent-dim", type=int, default=64)
+    p.add_argument(
+        "--kl-weight",
+        type=float,
+        default=0.1,
+        help="Weight on the KL term. The previous hidden default (1e-4) let the "
+             "posterior drift unregularized (KL climbed from ~4 to ~8+ over 199 epochs "
+             "instead of shrinking), making the deterministic 'mean' decode unusable "
+             "even though the decoder had learned real structure. Raised the default "
+             "here; tune further based on whether KL stabilizes/shrinks during training.",
+    )
 
     p.add_argument("--n-surface-points", type=int, default=4096)
     p.add_argument("--n-query-points", type=int, default=2048)
@@ -90,6 +100,7 @@ def run_epoch(
         accum_steps=1,
         start_step=0,
         checkpoint_callback=None,
+        kl_weight=0.1,
 ):
     """optimizer=None runs a validation pass instead of a training pass."""
     is_train = optimizer is not None
@@ -119,7 +130,9 @@ def run_epoch(
                 n_pos = labels.sum().clamp(min=1.0)
                 n_neg = (labels.numel() - labels.sum()).clamp(min=1.0)
                 pos_weight = (n_neg / n_pos).detach()
-                loss, recon, kl = vae_loss(logits, labels, mean, logvar, pos_weight=pos_weight)
+                loss, recon, kl = vae_loss(
+                    logits, labels, mean, logvar, kl_weight=kl_weight, pos_weight=pos_weight
+                )
 
         if is_train:
             scaled_loss = loss / accum_steps
@@ -183,28 +196,20 @@ def compute_validation_metrics(model, val_loader, device, max_batches=3):
     return {k: float(np.mean(v)) if v else 0.0 for k, v in metrics.items()}
 
 
-def check_reconstruction(model, val_loader, device, epoch, resolution=48):
-    model.eval()
-    batch = next(iter(val_loader))
-    surface_xyz = batch["surface_xyz"][:1].to(device)
-    skeleton_points = batch["skeleton_points"][:1].to(device)
+def _decode_grid_and_report(model, latent, label, device, epoch, resolution):
+    grid_coords = torch.linspace(-1, 1, resolution, device=device)
+    grid = torch.stack(
+        torch.meshgrid(grid_coords, grid_coords, grid_coords, indexing="ij"), dim=-1
+    )
+    grid = grid.reshape(1, -1, 3)
 
-    with torch.no_grad():
-        mean, _ = model.encode(surface_xyz, skeleton_points)
-
-        grid_coords = torch.linspace(-1, 1, resolution)
-        grid = torch.stack(
-            torch.meshgrid(grid_coords, grid_coords, grid_coords, indexing="ij"), dim=-1
-        )
-        grid = grid.reshape(1, -1, 3).to(device)
-
-        logits = model.decoder(grid, mean)
-        occupancy = torch.sigmoid(logits).reshape(resolution, resolution, resolution)
-        occupancy_np = occupancy.cpu().numpy()
+    logits = model.decoder(grid, latent)
+    occupancy = torch.sigmoid(logits).reshape(resolution, resolution, resolution)
+    occupancy_np = occupancy.cpu().numpy()
 
     occupied_fraction = float(np.mean(occupancy_np > 0.5))
     print(
-        f"  reconstruction check: occupied_fraction={occupied_fraction:.3f}, "
+        f"  [{label}] occupied_fraction={occupied_fraction:.3f}, "
         f"mean_prob={occupancy_np.mean():.6f}, std_prob={occupancy_np.std():.6f}, "
         f"min_prob={occupancy_np.min():.6f}, max_prob={occupancy_np.max():.6f}",
         flush=True,
@@ -214,10 +219,35 @@ def check_reconstruction(model, val_loader, device, epoch, resolution=48):
         verts, faces, _, _ = measure.marching_cubes(occupancy_np, level=0.5)
         out_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
         os.makedirs("reconstructions", exist_ok=True)
-        out_mesh.export(f"reconstructions/epoch_{epoch}.obj")
-        print(f"  saved reconstructions/epoch_{epoch}.obj")
+        out_path = f"reconstructions/epoch_{epoch}_{label}.obj"
+        out_mesh.export(out_path)
+        print(f"  saved {out_path}")
     except (ValueError, RuntimeError) as e:
-        print(f"  reconstruction check failed (likely all-in or all-out): {e}")
+        print(f"  [{label}] failed (likely all-in or all-out): {e}")
+
+
+def check_reconstruction(model, val_loader, device, epoch, resolution=48):
+    """
+    Decodes TWO ways and prints both, to distinguish "model hasn't learned
+    enough yet" from "decoder was only ever trained on noisy (reparameterized)
+    latents and the clean mean is out-of-distribution for it" -- the latter
+    is a real possibility when kl_weight is small enough that logvar isn't
+    well-regularized (watch whether 'mean' and 'sample' results differ a lot).
+    """
+    model.eval()
+    batch = next(iter(val_loader))
+    surface_xyz = batch["surface_xyz"][:1].to(device)
+    skeleton_points = batch["skeleton_points"][:1].to(device)
+
+    with torch.no_grad():
+        mean, logvar = model.encode(surface_xyz, skeleton_points)
+        avg_posterior_std = float(torch.exp(0.5 * logvar).mean().item())
+        print(f"  average posterior std (exp(0.5*logvar)): {avg_posterior_std:.4f}", flush=True)
+
+        _decode_grid_and_report(model, mean, "mean", device, epoch, resolution)
+
+        sampled_z = model.reparameterize(mean, logvar)
+        _decode_grid_and_report(model, sampled_z, "sample", device, epoch, resolution)
 
 
 def main():
@@ -290,9 +320,10 @@ def main():
                 if step % args.checkpoint_every_steps == 0
                 else None
             ),
+            kl_weight=args.kl_weight,
         )
         resume_step = 0
-        val_loss, val_recon, val_kl = run_epoch(model, val_loader, device)
+        val_loss, val_recon, val_kl = run_epoch(model, val_loader, device, kl_weight=args.kl_weight)
         val_metrics = compute_validation_metrics(model, val_loader, device)
 
         print(
