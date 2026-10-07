@@ -18,11 +18,22 @@ import numpy as np
 
 
 class PointEmbed(nn.Module):
-    """Fourier positional embedding for raw xyz coordinates."""
+    """
+    Fourier positional embedding for raw xyz coordinates.
 
-    def __init__(self, dim=48, out_dim=128):
+    freq_scale controls how high-frequency the embedding is. Too high,
+    combined with sparse per-object training supervision (a few thousand
+    query points, not a dense grid), risks the decoder fitting training
+    points well while behaving almost arbitrarily between them -- producing
+    scattered, disconnected blobs rather than one smooth continuous surface.
+    Lowered from the original 8.0 default for this reason; raise it back if
+    reconstructions become too blobby/low-detail once this is no longer the
+    limiting problem.
+    """
+
+    def __init__(self, dim=48, out_dim=128, freq_scale=2.0):
         super().__init__()
-        self.freqs = nn.Parameter(torch.randn(dim // 2, 3) * 8.0, requires_grad=False)
+        self.freqs = nn.Parameter(torch.randn(dim // 2, 3) * freq_scale, requires_grad=False)
         self.proj = nn.Linear(dim, out_dim)
 
     def forward(self, points):

@@ -27,11 +27,20 @@ def parse_args():
         "--kl-weight",
         type=float,
         default=0.1,
-        help="Weight on the KL term. The previous hidden default (1e-4) let the "
-             "posterior drift unregularized (KL climbed from ~4 to ~8+ over 199 epochs "
-             "instead of shrinking), making the deterministic 'mean' decode unusable "
-             "even though the decoder had learned real structure. Raised the default "
-             "here; tune further based on whether KL stabilizes/shrinks during training.",
+        help="TARGET kl_weight, reached at the end of warmup (see --kl-warmup-epochs), "
+             "not applied from epoch 1. Full-strength kl_weight from the start risks "
+             "posterior collapse (encoder stops encoding real per-object information; "
+             "watch for fragmented/incoherent reconstructions, worse than an "
+             "under-regularized posterior's blocky-but-real structure).",
+    )
+    p.add_argument(
+        "--kl-warmup-epochs",
+        type=int,
+        default=50,
+        help="Linearly ramp kl_weight from 0 to --kl-weight over this many epochs, "
+             "instead of applying full KL pressure immediately. Lets the encoder/decoder "
+             "learn real reconstruction first, before the posterior gets pulled toward "
+             "the prior. Standard fix for VAE posterior collapse.",
     )
 
     p.add_argument("--n-surface-points", type=int, default=4096)
@@ -196,7 +205,7 @@ def compute_validation_metrics(model, val_loader, device, max_batches=3):
     return {k: float(np.mean(v)) if v else 0.0 for k, v in metrics.items()}
 
 
-def _decode_grid_and_report(model, latent, label, device, epoch, resolution):
+def _decode_grid_and_report(model, latent, label, device, epoch, resolution, run_id=None):
     grid_coords = torch.linspace(-1, 1, resolution, device=device)
     grid = torch.stack(
         torch.meshgrid(grid_coords, grid_coords, grid_coords, indexing="ij"), dim=-1
@@ -219,14 +228,15 @@ def _decode_grid_and_report(model, latent, label, device, epoch, resolution):
         verts, faces, _, _ = measure.marching_cubes(occupancy_np, level=0.5)
         out_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
         os.makedirs("reconstructions", exist_ok=True)
-        out_path = f"reconstructions/epoch_{epoch}_{label}.obj"
+        suffix = f"_{run_id}" if run_id else ""
+        out_path = f"reconstructions/epoch_{epoch}_{label}{suffix}.obj"
         out_mesh.export(out_path)
         print(f"  saved {out_path}")
     except (ValueError, RuntimeError) as e:
         print(f"  [{label}] failed (likely all-in or all-out): {e}")
 
 
-def check_reconstruction(model, val_loader, device, epoch, resolution=48):
+def check_reconstruction(model, val_loader, device, epoch, resolution=48, run_id=None):
     """
     Decodes TWO ways and prints both, to distinguish "model hasn't learned
     enough yet" from "decoder was only ever trained on noisy (reparameterized)
@@ -244,10 +254,14 @@ def check_reconstruction(model, val_loader, device, epoch, resolution=48):
         avg_posterior_std = float(torch.exp(0.5 * logvar).mean().item())
         print(f"  average posterior std (exp(0.5*logvar)): {avg_posterior_std:.4f}", flush=True)
 
-        _decode_grid_and_report(model, mean, "mean", device, epoch, resolution)
+        if run_id is None:
+            import time
+            run_id = f"{int(time.time())}"
+
+        _decode_grid_and_report(model, mean, "mean", device, epoch, resolution, run_id)
 
         sampled_z = model.reparameterize(mean, logvar)
-        _decode_grid_and_report(model, sampled_z, "sample", device, epoch, resolution)
+        _decode_grid_and_report(model, sampled_z, "sample", device, epoch, resolution, run_id)
 
 
 def main():
@@ -305,7 +319,11 @@ def main():
         )
 
     for epoch in range(start_epoch, args.epochs + 1):
-        print(f"starting epoch {epoch}/{args.epochs}", flush=True)
+        current_kl_weight = args.kl_weight * min(1.0, epoch / max(args.kl_warmup_epochs, 1))
+        print(
+            f"starting epoch {epoch}/{args.epochs} (kl_weight={current_kl_weight:.6f})",
+            flush=True,
+        )
         train_loss, train_recon, train_kl = run_epoch(
             model,
             train_loader,
@@ -320,10 +338,12 @@ def main():
                 if step % args.checkpoint_every_steps == 0
                 else None
             ),
-            kl_weight=args.kl_weight,
+            kl_weight=current_kl_weight,
         )
         resume_step = 0
-        val_loss, val_recon, val_kl = run_epoch(model, val_loader, device, kl_weight=args.kl_weight)
+        val_loss, val_recon, val_kl = run_epoch(
+            model, val_loader, device, kl_weight=current_kl_weight
+        )
         val_metrics = compute_validation_metrics(model, val_loader, device)
 
         print(

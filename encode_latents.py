@@ -34,11 +34,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     checkpoint = torch.load(args.vae_ckpt, map_location=device, weights_only=False)
-                                                                           
-                                                                             
-                                                                        
-                                                                     
-                                                           
+
     if "model_state" in checkpoint:
         state = checkpoint["model_state"]
         train_args = checkpoint.get("args", {})
@@ -71,11 +67,20 @@ def main():
             xyz = batch["surface_xyz"].to(device)
             skeleton_points = batch["skeleton_points"].to(device)
             with torch.autocast(
-                device_type="cuda",
-                enabled=(args.amp and device == "cuda"),
+                    device_type="cuda",
+                    enabled=(args.amp and device == "cuda"),
             ):
-                mean, _ = model.encode(xyz, skeleton_points)
-            latents = mean.cpu().numpy()
+                mean, logvar = model.encode(xyz, skeleton_points)
+                # Cache a reparameterized SAMPLE, not the raw mean. Confirmed
+                # via check_vae_now.py: [mean] decoding still fails (globally
+                # biased, no usable threshold crossing) while [sample]
+                # decoding works correctly -- the decoder was only ever
+                # trained on samples, so that's what the DiT should learn to
+                # generate too. Standard practice for latent diffusion models
+                # built on a VAE (e.g. Stable Diffusion trains on encoder
+                # samples, not the deterministic mean).
+                sample = model.reparameterize(mean, logvar)
+            latents = sample.cpu().numpy()
 
             for i in range(latents.shape[0]):
                 src_path = ds.paths[offset + i]
