@@ -178,7 +178,13 @@ def run_epoch(
 def compute_validation_metrics(model, val_loader, device, max_batches=3):
     model.eval()
     with torch.no_grad():
-        metrics = {"bce": [], "iou": [], "occupancy_ratio": [], "latent_std": []}
+        metrics = {
+            "bce": [],
+            "iou": [],
+            "occupancy_ratio": [],
+            "pred_occupancy_ratio": [],
+            "latent_std": [],
+        }
         seen = 0
         for batch in val_loader:
             if seen >= max_batches:
@@ -201,6 +207,7 @@ def compute_validation_metrics(model, val_loader, device, max_batches=3):
             metrics["iou"].append(iou)
             metrics["occupancy_ratio"].append(float(labels.mean().item()))
             metrics["latent_std"].append(float(mean.std().item()))
+            metrics["pred_occupancy_ratio"].append(float(pred.mean().item()))
 
     return {k: float(np.mean(v)) if v else 0.0 for k, v in metrics.items()}
 
@@ -350,8 +357,11 @@ def main():
             f"epoch {epoch:03d} | "
             f"train loss {train_loss:.4f} (recon {train_recon:.4f} kl {train_kl:.4f}) | "
             f"val loss {val_loss:.4f} (recon {val_recon:.4f} kl {val_kl:.4f}) | "
-            f"val bce {val_metrics['bce']:.4f} iou {val_metrics['iou']:.4f} "
-            f"shape_ratio {val_metrics['occupancy_ratio']:.4f} latent_std {val_metrics['latent_std']:.4f}"
+            f"val bce {val_metrics['bce']:.4f} "
+            f"iou {val_metrics['iou']:.4f} "
+            f"shape_ratio {val_metrics['occupancy_ratio']:.4f} "
+            f"pred_ratio {val_metrics['pred_occupancy_ratio']:.4f} "
+            f"latent_std {val_metrics['latent_std']:.4f}"
         )
 
         checkpoint = {

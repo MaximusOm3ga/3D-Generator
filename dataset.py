@@ -29,6 +29,8 @@ class SkeletalMeshDataset(Dataset):
         include_occupancy=True,
     ):
         self.paths = sorted(glob.glob(os.path.join(cache_dir, "*.npz")))
+
+
         if len(self.paths) == 0:
             raise RuntimeError(
                 f"No .npz files found in {cache_dir} -- run prepare_data.py first"
