@@ -90,31 +90,55 @@ class SkeletonQueryEncoder(nn.Module):
 
 
 class OccupancyDecoder(nn.Module):
-    """
-    For each 3D query point, cross-attend into the latent tokens and
-    predict occupancy (inside/outside), used with marching cubes at
-    inference to extract the final mesh surface.
-    """
-
     def __init__(self, latent_dim=64, embed_dim=128, n_heads=4):
         super().__init__()
+
         self.query_embed = PointEmbed(out_dim=embed_dim)
+
         self.token_proj = nn.Linear(latent_dim, embed_dim)
-        self.cross_attn = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True)
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim,
+            n_heads,
+            batch_first=True
+        )
+
+        self.norm = nn.LayerNorm(embed_dim)
+
         self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(embed_dim * 2, 256),
             nn.GELU(),
-            nn.Linear(embed_dim, 1),
+
+            nn.Linear(256, 256),
+            nn.GELU(),
+
+            nn.Linear(256, 128),
+            nn.GELU(),
+
+            nn.Linear(128, 1),
         )
 
     def forward(self, query_points, latent_tokens):
-                                                                    
+
         q = self.query_embed(query_points)
         kv = self.token_proj(latent_tokens)
-        attended, _ = self.cross_attn(q, kv, kv)
-        occupancy_logits = self.mlp(attended).squeeze(-1)          
-        return occupancy_logits
 
+        attended, _ = self.cross_attn(
+            q,
+            kv,
+            kv
+        )
+
+        attended = self.norm(q + attended)
+
+        x = torch.cat(
+            [q, attended],
+            dim=-1
+        )
+
+        occupancy_logits = self.mlp(x).squeeze(-1)
+
+        return occupancy_logits
 
 class SkeletalVAE(nn.Module):
     def __init__(self, embed_dim=128, latent_dim=64):
@@ -131,8 +155,7 @@ class SkeletalVAE(nn.Module):
 
     def forward(self, surface_points, skeleton_points, query_points):
         mean, logvar = self.encode(surface_points, skeleton_points)
-        latent_tokens = self.reparameterize(mean, logvar)
-        occupancy_logits = self.decoder(query_points, latent_tokens)
+        occupancy_logits = self.decoder(query_points, mean)
         return occupancy_logits, mean, logvar
 
 
