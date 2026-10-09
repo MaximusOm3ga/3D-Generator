@@ -21,23 +21,22 @@ class PointEmbed(nn.Module):
     """
     Fourier positional embedding for raw xyz coordinates.
 
-    freq_scale controls how high-frequency the embedding is. Too high,
-    combined with sparse per-object training supervision (a few thousand
-    query points, not a dense grid), risks the decoder fitting training
-    points well while behaving almost arbitrarily between them -- producing
-    scattered, disconnected blobs rather than one smooth continuous surface.
-    Lowered from the original 8.0 default for this reason; raise it back if
-    reconstructions become too blobby/low-detail once this is no longer the
-    limiting problem.
+    freq_scale sets how fine a spatial function the decoder can express.
+    MEASURED, not assumed: fitting one thin-winged synthetic airplane with a
+    free latent, dense-grid IoU was 0.094 at freq_scale=2 (predicted ~11x too
+    much occupied volume, i.e. a fat smooth blob) vs 0.24 at 4-8 with much
+    lower train loss. Too low a scale cannot carve wings/tails, which gives
+    smooth capsule-like reconstructions. 8.0 is the setting that produced
+    recognizable airplane structure; lowering it to 2.0 made things worse.
     """
 
-    def __init__(self, dim=48, out_dim=128, freq_scale=2.0):
+    def __init__(self, dim=48, out_dim=128, freq_scale=8.0):
         super().__init__()
         self.freqs = nn.Parameter(torch.randn(dim // 2, 3) * freq_scale, requires_grad=False)
         self.proj = nn.Linear(dim, out_dim)
 
     def forward(self, points):
-                           
+
         proj = torch.einsum("bnd,fd->bnf", points, self.freqs)
         embedded = torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
         return self.proj(embedded)
@@ -52,10 +51,10 @@ class SkeletonQueryEncoder(nn.Module):
     instead of skeleton-derived ones.
     """
 
-    def __init__(self, embed_dim=128, latent_dim=64, n_heads=4, n_self_attn_layers=4):
+    def __init__(self, embed_dim=128, latent_dim=64, n_heads=4, n_self_attn_layers=4, freq_scale=8.0):
         super().__init__()
-        self.point_embed = PointEmbed(out_dim=embed_dim)
-        self.skeleton_embed = PointEmbed(out_dim=embed_dim)
+        self.point_embed = PointEmbed(out_dim=embed_dim, freq_scale=freq_scale)
+        self.skeleton_embed = PointEmbed(out_dim=embed_dim, freq_scale=freq_scale)
 
         self.cross_attn = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True)
         self.cross_norm = nn.LayerNorm(embed_dim)
@@ -73,8 +72,8 @@ class SkeletonQueryEncoder(nn.Module):
         self.to_logvar = nn.Linear(embed_dim, latent_dim)
 
     def forward(self, surface_points, skeleton_points):
-                                                                           
-                                                                       
+
+
         kv = self.point_embed(surface_points)
         q = self.skeleton_embed(skeleton_points)
 
@@ -90,61 +89,37 @@ class SkeletonQueryEncoder(nn.Module):
 
 
 class OccupancyDecoder(nn.Module):
-    def __init__(self, latent_dim=64, embed_dim=128, n_heads=4):
+    """
+    For each 3D query point, cross-attend into the latent tokens and
+    predict occupancy (inside/outside), used with marching cubes at
+    inference to extract the final mesh surface.
+    """
+
+    def __init__(self, latent_dim=64, embed_dim=128, n_heads=4, freq_scale=8.0):
         super().__init__()
-
-        self.query_embed = PointEmbed(out_dim=embed_dim)
-
+        self.query_embed = PointEmbed(out_dim=embed_dim, freq_scale=freq_scale)
         self.token_proj = nn.Linear(latent_dim, embed_dim)
-
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim,
-            n_heads,
-            batch_first=True
-        )
-
-        self.norm = nn.LayerNorm(embed_dim)
-
+        self.cross_attn = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True)
         self.mlp = nn.Sequential(
-            nn.Linear(embed_dim * 2, 256),
+            nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
-
-            nn.Linear(256, 256),
-            nn.GELU(),
-
-            nn.Linear(256, 128),
-            nn.GELU(),
-
-            nn.Linear(128, 1),
+            nn.Linear(embed_dim, 1),
         )
 
     def forward(self, query_points, latent_tokens):
 
         q = self.query_embed(query_points)
         kv = self.token_proj(latent_tokens)
-
-        attended, _ = self.cross_attn(
-            q,
-            kv,
-            kv
-        )
-
-        attended = self.norm(q + attended)
-
-        x = torch.cat(
-            [q, attended],
-            dim=-1
-        )
-
-        occupancy_logits = self.mlp(x).squeeze(-1)
-
+        attended, _ = self.cross_attn(q, kv, kv)
+        occupancy_logits = self.mlp(attended).squeeze(-1)
         return occupancy_logits
 
+
 class SkeletalVAE(nn.Module):
-    def __init__(self, embed_dim=128, latent_dim=64):
+    def __init__(self, embed_dim=128, latent_dim=64, freq_scale=8.0):
         super().__init__()
-        self.encoder = SkeletonQueryEncoder(embed_dim=embed_dim, latent_dim=latent_dim)
-        self.decoder = OccupancyDecoder(latent_dim=latent_dim, embed_dim=embed_dim)
+        self.encoder = SkeletonQueryEncoder(embed_dim=embed_dim, latent_dim=latent_dim, freq_scale=freq_scale)
+        self.decoder = OccupancyDecoder(latent_dim=latent_dim, embed_dim=embed_dim, freq_scale=freq_scale)
 
     def encode(self, surface_points, skeleton_points):
         return self.encoder(surface_points, skeleton_points)
@@ -155,7 +130,8 @@ class SkeletalVAE(nn.Module):
 
     def forward(self, surface_points, skeleton_points, query_points):
         mean, logvar = self.encode(surface_points, skeleton_points)
-        occupancy_logits = self.decoder(query_points, mean)
+        latent_tokens = self.reparameterize(mean, logvar)
+        occupancy_logits = self.decoder(query_points, latent_tokens)
         return occupancy_logits, mean, logvar
 
 

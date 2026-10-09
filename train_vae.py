@@ -21,12 +21,21 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--check-every", type=int, default=10)
 
+    p.add_argument(
+        "--freq-scale",
+        type=float,
+        default=8.0,
+        help="Fourier positional-embedding frequency scale. 8.0 = the setting that "
+        "produced airplane structure; 2.0 gave smooth capsule blobs (can't represent "
+        "thin wings). Stored in the checkpoint's frequencies, so no need to pass it "
+        "to encode_latents/sample_dit/check_vae_now.",
+    )
     p.add_argument("--embed-dim", type=int, default=128)
     p.add_argument("--latent-dim", type=int, default=64)
     p.add_argument(
         "--kl-weight",
         type=float,
-        default=1e-4,
+        default=0.1,
         help="TARGET kl_weight, reached at the end of warmup (see --kl-warmup-epochs), "
              "not applied from epoch 1. Full-strength kl_weight from the start risks "
              "posterior collapse (encoder stops encoding real per-object information; "
@@ -178,7 +187,13 @@ def run_epoch(
 def compute_validation_metrics(model, val_loader, device, max_batches=3):
     model.eval()
     with torch.no_grad():
-        metrics = {"bce": [], "iou": [], "occupancy_ratio": [], "latent_std": []}
+        metrics = {
+            "bce": [],
+            "iou": [],
+            "occupancy_ratio": [],
+            "pred_occupancy_ratio": [],
+            "latent_std": [],
+        }
         seen = 0
         for batch in val_loader:
             if seen >= max_batches:
@@ -201,6 +216,7 @@ def compute_validation_metrics(model, val_loader, device, max_batches=3):
             metrics["iou"].append(iou)
             metrics["occupancy_ratio"].append(float(labels.mean().item()))
             metrics["latent_std"].append(float(mean.std().item()))
+            metrics["pred_occupancy_ratio"].append(float(pred.mean().item()))
 
     return {k: float(np.mean(v)) if v else 0.0 for k, v in metrics.items()}
 
@@ -277,6 +293,7 @@ def main():
     model = SkeletalVAE(
         embed_dim=args.embed_dim,
         latent_dim=args.latent_dim,
+        freq_scale=args.freq_scale,
     ).to(device)
 
     start_epoch = 1
@@ -350,8 +367,11 @@ def main():
             f"epoch {epoch:03d} | "
             f"train loss {train_loss:.4f} (recon {train_recon:.4f} kl {train_kl:.4f}) | "
             f"val loss {val_loss:.4f} (recon {val_recon:.4f} kl {val_kl:.4f}) | "
-            f"val bce {val_metrics['bce']:.4f} iou {val_metrics['iou']:.4f} "
-            f"shape_ratio {val_metrics['occupancy_ratio']:.4f} latent_std {val_metrics['latent_std']:.4f}"
+            f"val bce {val_metrics['bce']:.4f} "
+            f"iou {val_metrics['iou']:.4f} "
+            f"shape_ratio {val_metrics['occupancy_ratio']:.4f} "
+            f"pred_ratio {val_metrics['pred_occupancy_ratio']:.4f} "
+            f"latent_std {val_metrics['latent_std']:.4f}"
         )
 
         checkpoint = {

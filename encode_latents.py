@@ -79,8 +79,7 @@ def main():
                 # generate too. Standard practice for latent diffusion models
                 # built on a VAE (e.g. Stable Diffusion trains on encoder
                 # samples, not the deterministic mean).
-                sample = model.reparameterize(mean, logvar)
-            latents = sample.cpu().numpy()
+                latents = mean.float().cpu().numpy()
 
             for i in range(latents.shape[0]):
                 src_path = ds.paths[offset + i]
