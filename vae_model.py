@@ -101,7 +101,7 @@ class OccupancyDecoder(nn.Module):
         self.token_proj = nn.Linear(latent_dim, embed_dim)
         self.cross_attn = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True)
         self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(embed_dim * 2, embed_dim),
             nn.GELU(),
             nn.Linear(embed_dim, 1),
         )
@@ -111,15 +111,21 @@ class OccupancyDecoder(nn.Module):
         q = self.query_embed(query_points)
         kv = self.token_proj(latent_tokens)
         attended, _ = self.cross_attn(q, kv, kv)
-        occupancy_logits = self.mlp(attended).squeeze(-1)
+        spatial = q + attended
+        occupancy_logits = self.mlp(torch.cat([spatial, q], dim=-1)).squeeze(-1)
         return occupancy_logits
 
 
 class SkeletalVAE(nn.Module):
-    def __init__(self, embed_dim=128, latent_dim=64, freq_scale=8.0):
+    def __init__(self, embed_dim=128, latent_dim=64, freq_scale=8.0, target_mode="occupancy"):
         super().__init__()
-        self.encoder = SkeletonQueryEncoder(embed_dim=embed_dim, latent_dim=latent_dim, freq_scale=freq_scale)
-        self.decoder = OccupancyDecoder(latent_dim=latent_dim, embed_dim=embed_dim, freq_scale=freq_scale)
+        self.encoder = SkeletonQueryEncoder(
+            embed_dim=embed_dim, latent_dim=latent_dim, freq_scale=freq_scale
+        )
+        self.decoder = OccupancyDecoder(
+            latent_dim=latent_dim, embed_dim=embed_dim, freq_scale=freq_scale
+        )
+        self.target_mode = str(target_mode).lower()
 
     def encode(self, surface_points, skeleton_points):
         return self.encoder(surface_points, skeleton_points)
@@ -131,8 +137,8 @@ class SkeletalVAE(nn.Module):
     def forward(self, surface_points, skeleton_points, query_points):
         mean, logvar = self.encode(surface_points, skeleton_points)
         latent_tokens = self.reparameterize(mean, logvar)
-        occupancy_logits = self.decoder(query_points, latent_tokens)
-        return occupancy_logits, mean, logvar
+        field = self.decoder(query_points, latent_tokens)
+        return field, mean, logvar
 
 
 class ConditionProjector(nn.Module):
@@ -301,20 +307,24 @@ class TriplaneVAE(nn.Module):
         return occupancy_logits, mean, logvar
 
 
-def vae_loss(occupancy_logits, occupancy_labels, mean, logvar, kl_weight=1e-4, pos_weight=None):
+def vae_loss(
+    logits,
+    labels,
+    mean,
+    logvar,
+    kl_weight=1e-4,
+    pos_weight=None,
+    target_mode="occupancy",
+):
     """
-    pos_weight: scalar tensor upweighting "inside" (label=1) examples in the
-    BCE loss. Without this, thin/sparse shapes (airplanes, chairs with lots
-    of empty space in their bounding box) let the model trivially minimize
-    loss by always predicting "empty" everywhere -- a real degenerate
-    minimum, not a training-time artifact, and one plain BCE will happily
-    converge to given enough epochs. Compute from each batch's actual
-    negative:positive ratio (see train_vae.py) so it adapts automatically
-    rather than needing a fixed hyperparameter per dataset/category.
+    target_mode selects either binary occupancy or signed-distance supervision.
     """
-    recon_loss = nn.functional.binary_cross_entropy_with_logits(
-        occupancy_logits, occupancy_labels, pos_weight=pos_weight
-    )
+    if target_mode == "sdf":
+        recon_loss = nn.functional.smooth_l1_loss(logits, labels, reduction="mean")
+    else:
+        recon_loss = nn.functional.binary_cross_entropy_with_logits(
+            logits, labels, pos_weight=pos_weight
+        )
     kl_loss = -0.5 * torch.mean(1 + logvar - mean.pow(2) - logvar.exp())
     return recon_loss + kl_weight * kl_loss, recon_loss, kl_loss
 

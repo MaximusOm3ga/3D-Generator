@@ -2,7 +2,7 @@ import argparse
 import os
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 from skimage import measure
 import trimesh
 
@@ -58,6 +58,30 @@ def parse_args():
     p.add_argument("--accum-steps", type=int, default=4)
     p.add_argument("--checkpoint-every-steps", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--target-mode",
+        type=str,
+        choices=["occupancy", "sdf"],
+        default="occupancy",
+        help="Training target mode for the decoder: occupancy or signed distance.",
+    )
+    p.add_argument(
+        "--sdf-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to SDF labels before training.",
+    )
+    p.add_argument(
+        "--debug-one-object",
+        action="store_true",
+        help="Use a single object for both train and validation to diagnose overfit and dense reconstruction.",
+    )
+    p.add_argument(
+        "--debug-object-index",
+        type=int,
+        default=0,
+        help="Object index to use in debug-one-object mode.",
+    )
     p.add_argument("--amp", action="store_true", help="use mixed precision (torch.autocast)")
     p.add_argument(
         "--num-workers",
@@ -76,22 +100,42 @@ def make_dataloaders(args):
         cache_dir=args.cache_dir,
         n_surface_points=args.n_surface_points,
         n_query_points=args.n_query_points,
+        target_mode=args.target_mode,
+        sdf_scale=args.sdf_scale,
+        include_occupancy=(args.target_mode == "occupancy"),
+        include_sdf=(args.target_mode == "sdf"),
     )
-    n_val = max(1, int(0.1 * len(full_dataset)))
-    n_train = len(full_dataset) - n_val
-    print(f"Dataset: {len(full_dataset)} objects total ({n_train} train / {n_val} val)")
+    if len(full_dataset) == 0:
+        raise RuntimeError(f"No cached objects found in {args.cache_dir}; run prepare_data.py first.")
 
-    effective_batch_size = min(args.batch_size, max(1, n_train))
-    if effective_batch_size < args.batch_size:
+    if args.debug_one_object:
+        idx = min(max(args.debug_object_index, 0), len(full_dataset) - 1)
+        train_set = val_set = Subset(full_dataset, [idx])
+        effective_batch_size = min(args.batch_size, max(1, len(train_set)))
         print(
-            f"WARNING: train set ({n_train}) smaller than batch_size "
-            f"({args.batch_size}) -- reducing to {effective_batch_size} for this run"
+            f"DEBUG one-object mode: using cached object index {idx} ({full_dataset.paths[idx]}) "
+            f"for both train and validation."
+        )
+    else:
+        n_val = max(1, int(0.1 * len(full_dataset)))
+        n_train = len(full_dataset) - n_val
+        print(f"Dataset: {len(full_dataset)} objects total ({n_train} train / {n_val} val)")
+        if n_train == 0:
+            raise RuntimeError(
+                "Training split is empty. Use --debug-one-object with a non-empty cache, "
+                "or add more cached objects."
+            )
+        effective_batch_size = min(args.batch_size, max(1, n_train))
+        if effective_batch_size < args.batch_size:
+            print(
+                f"WARNING: train set ({n_train}) smaller than batch_size "
+                f"({args.batch_size}) -- reducing to {effective_batch_size} for this run"
+            )
+        split_generator = torch.Generator().manual_seed(args.seed)
+        train_set, val_set = random_split(
+            full_dataset, [n_train, n_val], generator=split_generator
         )
 
-    split_generator = torch.Generator().manual_seed(args.seed)
-    train_set, val_set = random_split(
-        full_dataset, [n_train, n_val], generator=split_generator
-    )
     train_loader = DataLoader(
         train_set,
         batch_size=effective_batch_size,
@@ -125,6 +169,8 @@ def run_epoch(
     model.train(is_train)
 
     total_loss, total_recon, total_kl, n_batches = 0.0, 0.0, 0.0, 0
+    optimizer_updates = 0
+    accum_steps_done = 0
 
     if is_train:
         optimizer.zero_grad()
@@ -140,16 +186,25 @@ def run_epoch(
         with torch.set_grad_enabled(is_train):
             with torch.autocast(device_type=device, enabled=(use_amp and device == "cuda")):
                 logits, mean, logvar = model(surface_xyz, skeleton_points, query_points)
-                # Reweight for class imbalance: thin/sparse shapes (airplanes
-                # especially) have far more "empty" than "inside" query points,
-                # which otherwise lets the model collapse to always predicting
-                # empty -- a real degenerate minimum, confirmed by
-                # std_prob=0.000 after 185 real epochs without this fix.
-                n_pos = labels.sum().clamp(min=1.0)
-                n_neg = (labels.numel() - labels.sum()).clamp(min=1.0)
-                pos_weight = (n_neg / n_pos).detach()
+                target = (
+                    labels
+                    if "occupancy" == (getattr(model, "target_mode", "occupancy"))
+                    else batch["sdf_labels"].to(device)
+                )
+                if "occupancy" == getattr(model, "target_mode", "occupancy"):
+                    n_pos = labels.sum().clamp(min=1.0)
+                    n_neg = (labels.numel() - labels.sum()).clamp(min=1.0)
+                    pos_weight = (n_neg / n_pos).detach()
+                else:
+                    pos_weight = None
                 loss, recon, kl = vae_loss(
-                    logits, labels, mean, logvar, kl_weight=kl_weight, pos_weight=pos_weight
+                    logits,
+                    target,
+                    mean,
+                    logvar,
+                    kl_weight=kl_weight,
+                    pos_weight=pos_weight,
+                    target_mode=getattr(model, "target_mode", "occupancy"),
                 )
 
         if is_train:
@@ -158,14 +213,17 @@ def run_epoch(
                 scaler.scale(scaled_loss).backward()
             else:
                 scaled_loss.backward()
+            accum_steps_done += 1
 
-            if step % accum_steps == 0:
+            if accum_steps_done == accum_steps:
                 if scaler is not None:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     optimizer.step()
                 optimizer.zero_grad()
+                optimizer_updates += 1
+                accum_steps_done = 0
                 if checkpoint_callback is not None:
                     checkpoint_callback(step)
 
@@ -179,8 +237,26 @@ def run_epoch(
                 flush=True,
             )
 
+    if is_train and accum_steps_done > 0:
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad()
+        optimizer_updates += 1
+        if checkpoint_callback is not None:
+            checkpoint_callback(len(loader))
+
     if n_batches == 0:
         return float("nan"), float("nan"), float("nan")
+    if is_train and optimizer_updates == 0:
+        print(
+            "WARNING: zero optimizer updates in this epoch. Check the dataset split, "
+            "accumulation settings, and the debug-one-object configuration.",
+            flush=True,
+        )
+    print(f"  optimizer updates this epoch: {optimizer_updates}", flush=True)
     return total_loss / n_batches, total_recon / n_batches, total_kl / n_batches
 
 
@@ -243,6 +319,16 @@ def _decode_grid_and_report(model, latent, label, device, epoch, resolution, run
     try:
         verts, faces, _, _ = measure.marching_cubes(occupancy_np, level=0.5)
         out_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        occupied = occupancy_np > 0.5
+        if occupied.any():
+            labels, connected = measure.label(occupied, return_num=True)
+            connected = int(connected)
+        else:
+            connected = 0
+        print(
+            f"  [{label}] extraction: vertices={len(out_mesh.vertices)} faces={len(out_mesh.faces)} "
+            f"connected_components={connected} finite={np.isfinite(out_mesh.vertices).all()}"
+        )
         os.makedirs("reconstructions", exist_ok=True)
         suffix = f"_{run_id}" if run_id else ""
         out_path = f"reconstructions/epoch_{epoch}_{label}{suffix}.obj"
@@ -293,7 +379,7 @@ def main():
     model = SkeletalVAE(
         embed_dim=args.embed_dim,
         latent_dim=args.latent_dim,
-        freq_scale=args.freq_scale,
+        target_mode=args.target_mode,
     ).to(device)
 
     start_epoch = 1
@@ -301,6 +387,11 @@ def main():
     if args.resume and os.path.exists(args.resume):
         print(f"Resuming from {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        target_mode = checkpoint.get("target_mode", "occupancy")
+        if target_mode != "occupancy":
+            raise ValueError(
+                f"Checkpoint target_mode={target_mode!r} is incompatible with this occupancy-only training path."
+            )
         model.load_state_dict(checkpoint["model_state"])
         start_epoch = checkpoint.get("epoch", 0)
         if checkpoint.get("batch_step", 0) == 0:
@@ -329,6 +420,8 @@ def main():
                 "epoch": epoch,
                 "batch_step": batch_step,
                 "best_val_loss": best_loss,
+                "target_mode": "occupancy",
+                "architecture": "skeletal_vae_legacy",
                 "args": vars(args),
                 "rng_state": capture_rng_state(),
             },
@@ -381,6 +474,8 @@ def main():
             "epoch": epoch,
             "batch_step": 0,
             "best_val_loss": best_val_loss,
+            "target_mode": "occupancy",
+            "architecture": "skeletal_vae_legacy",
             "args": vars(args),
             "rng_state": capture_rng_state(),
         }

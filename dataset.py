@@ -27,9 +27,11 @@ class SkeletalMeshDataset(Dataset):
         include_fourier_features=True,
         fourier_bands=8,
         include_occupancy=True,
+        include_sdf=False,
+        target_mode="occupancy",
+        sdf_scale=1.0,
     ):
         self.paths = sorted(glob.glob(os.path.join(cache_dir, "*.npz")))
-
 
         if len(self.paths) == 0:
             raise RuntimeError(
@@ -42,6 +44,9 @@ class SkeletalMeshDataset(Dataset):
         self.include_fourier_features = include_fourier_features
         self.fourier_bands = fourier_bands
         self.include_occupancy = include_occupancy
+        self.include_sdf = include_sdf or (str(target_mode).lower() == "sdf")
+        self.target_mode = str(target_mode).lower()
+        self.sdf_scale = float(sdf_scale)
 
     def __len__(self):
         return len(self.paths)
@@ -50,12 +55,7 @@ class SkeletalMeshDataset(Dataset):
         n_uniform = n_points // 2
         n_near = n_points - n_uniform
 
-                                                                                  
         uniform_points = np.random.uniform(-1.0, 1.0, size=(n_uniform, 3))
-
-                                                                              
-                                                                             
-                                                                     
         surface_samples, _ = trimesh.sample.sample_surface(mesh, n_near)
         noise = np.random.normal(scale=self.near_surface_std, size=surface_samples.shape)
         near_points = surface_samples + noise
@@ -64,11 +64,19 @@ class SkeletalMeshDataset(Dataset):
             np.float32
         )
 
-                                                                       
-                                                                            
         labels = mesh.contains(query_points).astype(np.float32)
-
         return query_points, labels
+
+    def _sample_query_targets(self, mesh, n_points):
+        query_points, occupancy_labels = self._sample_occupancy(mesh, n_points)
+        if self.target_mode == "occupancy":
+            return query_points, occupancy_labels, None
+
+        query = trimesh.proximity.ProximityQuery(mesh)
+        signed_distances = np.asarray(query.signed_distance(query_points), dtype=np.float32)
+        if self.sdf_scale:
+            signed_distances = signed_distances / self.sdf_scale
+        return query_points, occupancy_labels, signed_distances
 
     def __getitem__(self, idx):
         data = np.load(self.paths[idx])
@@ -78,12 +86,12 @@ class SkeletalMeshDataset(Dataset):
 
         surface_points, face_idx = trimesh.sample.sample_surface(mesh, self.n_surface_points)
         face_normals = mesh.face_normals[face_idx].astype(np.float32)
-        query_points, occupancy_labels = None, None
-        if self.include_occupancy:
-            query_points, occupancy_labels = self._sample_occupancy(
+        query_points, occupancy_labels, sdf_labels = None, None, None
+        if self.include_occupancy or self.include_sdf:
+            query_points, occupancy_labels, sdf_labels = self._sample_query_targets(
                 mesh, self.n_query_points
             )
-        skeleton_points = data["skeleton_points"]                                   
+        skeleton_points = data["skeleton_points"]
 
         surface_features = [surface_points.astype(np.float32)]
         if self.include_normals:
@@ -99,9 +107,12 @@ class SkeletalMeshDataset(Dataset):
             "surface_xyz": torch.from_numpy(surface_points.astype(np.float32)),
             "skeleton_points": torch.from_numpy(skeleton_points.astype(np.float32)),
         }
-        if self.include_occupancy:
+        if self.include_occupancy or self.include_sdf:
             out["query_points"] = torch.from_numpy(query_points)
-            out["occupancy_labels"] = torch.from_numpy(occupancy_labels)
+            if self.include_occupancy:
+                out["occupancy_labels"] = torch.from_numpy(occupancy_labels)
+            if self.include_sdf:
+                out["sdf_labels"] = torch.from_numpy(sdf_labels)
         return out
 
 

@@ -194,6 +194,7 @@ def main():
     vae = SkeletalVAE(
         embed_dim=vae_args.get("embed_dim", 128),
         latent_dim=vae_args.get("latent_dim", latent_dim),
+        target_mode=vae_args.get("target_mode", "occupancy"),
     ).to(device)
     vae.load_state_dict(vae_state, strict=True)
     vae.eval()

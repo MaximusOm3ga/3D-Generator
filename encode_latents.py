@@ -45,6 +45,7 @@ def main():
     model = SkeletalVAE(
         embed_dim=train_args.get("embed_dim", 128),
         latent_dim=train_args.get("latent_dim", 64),
+        target_mode=train_args.get("target_mode", "occupancy"),
     ).to(device)
     model.load_state_dict(state, strict=True)
     model.eval()

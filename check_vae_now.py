@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import os
 import torch
 from torch.utils.data import DataLoader
 
@@ -28,16 +29,27 @@ def parse_args():
 def main():
     args = parse_args()
     device = args.device
+    if not os.path.exists(args.vae_ckpt):
+        raise FileNotFoundError(f"VAE checkpoint not found: {args.vae_ckpt}")
+    if not args.vae_ckpt.endswith(".pt"):
+        raise ValueError(
+            f"Expected a checkpoint path ending in .pt, got: {args.vae_ckpt}. "
+            "Use a trained VAE checkpoint like checkpoints/vae_best.pt."
+        )
 
     checkpoint = torch.load(args.vae_ckpt, map_location=device, weights_only=False)
     state = checkpoint["model_state"] if "model_state" in checkpoint else checkpoint
     train_args = checkpoint.get("args", {})
     epoch = checkpoint.get("epoch", "unknown")
-    print(f"Loaded checkpoint from epoch {epoch}")
+    target_mode = checkpoint.get("target_mode", "occupancy")
+    if target_mode != "occupancy":
+        raise ValueError(f"Checkpoint target_mode={target_mode!r} is incompatible with the current occupancy-only VAE path.")
+    print(f"Loaded checkpoint from epoch {epoch} (target={target_mode})")
 
     model = SkeletalVAE(
         embed_dim=train_args.get("embed_dim", 128),
         latent_dim=train_args.get("latent_dim", 64),
+        target_mode=train_args.get("target_mode", "occupancy"),
     ).to(device)
     model.load_state_dict(state, strict=True)
 
