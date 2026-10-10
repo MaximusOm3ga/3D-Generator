@@ -6,3 +6,4 @@ samples
 *.iml
 *.xml
 internal.md
+checkpoints_debug_mean
