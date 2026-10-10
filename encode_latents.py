@@ -28,6 +28,17 @@ def parse_args():
     return p.parse_args()
 
 
+def validate_latent_batch(latents, expected_dim):
+    if latents.ndim != 3:
+        raise ValueError(f"Expected 3D latent batch [N, tokens, dim], got shape={latents.shape}")
+    if latents.shape[-1] != expected_dim:
+        raise ValueError(
+            f"Latent dimension mismatch: expected last dim={expected_dim}, got {latents.shape[-1]} in shape={latents.shape}"
+        )
+    if not np.isfinite(latents).all():
+        raise ValueError(f"Cached latent values are not finite; latent shape={latents.shape}")
+
+
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -77,14 +88,22 @@ def main():
                 # Keep production latent convention unchanged for diffusion:
                 # cache posterior means as deterministic per-object latents.
                 latents = mean.float().cpu().numpy()
+                validate_latent_batch(latents, model.encoder.to_mean.out_features)
 
             for i in range(latents.shape[0]):
                 src_path = ds.paths[offset + i]
                 uid = os.path.basename(src_path).replace(".npz", "")
+                latent_i = latents[i].astype(np.float32)
+                if latent_i.shape[-1] != model.encoder.to_mean.out_features:
+                    raise ValueError(
+                        f"Expected latent dim={model.encoder.to_mean.out_features}, got {latent_i.shape[-1]} for {uid}"
+                    )
+                if not np.isfinite(latent_i).all():
+                    raise ValueError(f"Latent cache contains non-finite values for {uid}")
                 np.savez(
                     os.path.join(args.out_dir, f"{uid}.npz"),
                     uid=uid,
-                    latent=latents[i].astype(np.float32),
+                    latent=latent_i,
                 )
             offset += latents.shape[0]
             print(f"encoded {offset}/{len(ds)} objects", flush=True)

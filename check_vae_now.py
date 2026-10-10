@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import os
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -23,6 +24,7 @@ def parse_args():
     p.add_argument("--cache-dir", type=str, default="cached_objects")
     p.add_argument("--resolution", type=int, default=48)
     p.add_argument("--debug-object-index", type=int, default=0)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -49,11 +51,12 @@ def main():
     print(f"Loaded checkpoint from epoch {epoch} (target={target_mode})")
 
     model = SkeletalVAE(
-        embed_dim=train_args.get("embed_dim", 128),
-        latent_dim=train_args.get("latent_dim", 64),
-        freq_scale=train_args.get("freq_scale", 8.0),
-        target_mode=train_args.get("target_mode", "occupancy"),
+        embed_dim=model_cfg.get("embed_dim", train_args.get("embed_dim", 128)),
+        latent_dim=model_cfg.get("latent_dim", train_args.get("latent_dim", 64)),
+        freq_scale=model_cfg.get("freq_scale", train_args.get("freq_scale", 8.0)),
+        target_mode=model_cfg.get("target_mode", train_args.get("target_mode", "occupancy")),
         decode_mode=model_cfg.get("decode_mode", train_args.get("decode_mode", "stochastic")),
+        use_pos_weight=model_cfg.get("use_pos_weight", train_args.get("use_pos_weight", True)),
     ).to(device)
     model.load_state_dict(state, strict=True)
 
@@ -63,7 +66,12 @@ def main():
         n_query_points=train_args.get("n_query_points", 1024),
     )
     debug_idx = min(max(args.debug_object_index, 0), len(ds) - 1)
-    sample = ds[debug_idx]
+    rng_state = np.random.get_state()
+    try:
+        np.random.seed(args.seed)
+        sample = ds[debug_idx]
+    finally:
+        np.random.set_state(rng_state)
     loader = DataLoader([sample], batch_size=1, shuffle=False, num_workers=0)
 
     check_reconstruction(model, loader, device, epoch=f"checkpoint_{epoch}", resolution=args.resolution)

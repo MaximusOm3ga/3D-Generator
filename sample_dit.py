@@ -114,14 +114,15 @@ def decode_to_mesh(vae, latent_tokens, device, resolution=64, threshold=0.5):
     logits = vae.decoder(grid, latent_tokens)
     occ = torch.sigmoid(logits).reshape(resolution, resolution, resolution).cpu().numpy()
 
+    if not np.isfinite(occ).all():
+        raise RuntimeError(f"Occupancy field contains NaN/Inf before mesh extraction; threshold={threshold:.3f}")
     vmin = float(occ.min())
     vmax = float(occ.max())
     if not (vmin < threshold < vmax):
-        threshold = float(np.quantile(occ, 0.5))
-    if not (vmin < threshold < vmax):
-        threshold = 0.5 * (vmin + vmax)
-    if not (vmin < threshold < vmax):
-        raise RuntimeError(f"Degenerate occupancy field: min={vmin:.6f}, max={vmax:.6f}")
+        raise RuntimeError(
+            f"Occupancy field does not cross threshold={threshold:.3f}; min={vmin:.6f}, max={vmax:.6f}. "
+            "No automatic threshold fallback is allowed."
+        )
 
     verts, faces, _, _ = measure.marching_cubes(occ, level=threshold)
     scale = 2.0 / (resolution - 1)
@@ -154,14 +155,15 @@ def decode_to_mesh_chunked(
 
     occ = torch.sigmoid(logits).reshape(resolution, resolution, resolution).cpu().numpy()
 
+    if not np.isfinite(occ).all():
+        raise RuntimeError(f"Occupancy field contains NaN/Inf before mesh extraction; threshold={threshold:.3f}")
     vmin = float(occ.min())
     vmax = float(occ.max())
     if not (vmin < threshold < vmax):
-        threshold = float(np.quantile(occ, 0.5))
-    if not (vmin < threshold < vmax):
-        threshold = 0.5 * (vmin + vmax)
-    if not (vmin < threshold < vmax):
-        raise RuntimeError(f"Degenerate occupancy field: min={vmin:.6f}, max={vmax:.6f}")
+        raise RuntimeError(
+            f"Occupancy field does not cross threshold={threshold:.3f}; min={vmin:.6f}, max={vmax:.6f}. "
+            "No automatic threshold fallback is allowed."
+        )
 
     verts, faces, _, _ = measure.marching_cubes(occ, level=threshold)
     scale = 2.0 / (resolution - 1)
@@ -194,7 +196,10 @@ def main():
     vae = SkeletalVAE(
         embed_dim=vae_args.get("embed_dim", 128),
         latent_dim=vae_args.get("latent_dim", latent_dim),
+        freq_scale=vae_args.get("freq_scale", 8.0),
         target_mode=vae_args.get("target_mode", "occupancy"),
+        decode_mode=vae_args.get("decode_mode", "stochastic"),
+        use_pos_weight=vae_args.get("use_pos_weight", True),
     ).to(device)
     vae.load_state_dict(vae_state, strict=True)
     vae.eval()

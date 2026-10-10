@@ -124,6 +124,7 @@ class SkeletalVAE(nn.Module):
         freq_scale=8.0,
         target_mode="occupancy",
         decode_mode="stochastic",
+        use_pos_weight=True,
     ):
         super().__init__()
         self.encoder = SkeletonQueryEncoder(
@@ -134,6 +135,7 @@ class SkeletalVAE(nn.Module):
         )
         self.target_mode = str(target_mode).lower()
         self.decode_mode = str(decode_mode).lower()
+        self.use_pos_weight = bool(use_pos_weight)
         if self.decode_mode not in {"stochastic", "mean"}:
             raise ValueError(
                 f"Unsupported decode_mode={self.decode_mode!r}. Expected 'stochastic' or 'mean'."

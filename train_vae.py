@@ -129,6 +129,7 @@ def build_vae_config(args):
         "freq_scale": float(args.freq_scale),
         "target_mode": str(args.target_mode).lower(),
         "decode_mode": str(args.decode_mode).lower(),
+        "use_pos_weight": bool(getattr(args, "use_pos_weight", True)),
     }
 
 
@@ -139,6 +140,14 @@ def _as_config_error(key, ckpt_value, run_value):
 def validate_checkpoint_compatibility(checkpoint, run_cfg):
     ckpt_cfg = checkpoint.get("model_config")
     if ckpt_cfg is None:
+        ckpt_cfg = {}
+        legacy_args = checkpoint.get("args", {}) or {}
+        for key in ("embed_dim", "latent_dim", "freq_scale", "target_mode", "decode_mode", "use_pos_weight"):
+            if key in legacy_args:
+                ckpt_cfg[key] = legacy_args[key]
+        if "architecture" in checkpoint:
+            ckpt_cfg["architecture"] = checkpoint["architecture"]
+    if not ckpt_cfg:
         raise ValueError(
             "Checkpoint missing model_config metadata and cannot be safely resumed with current compatibility checks."
         )
@@ -149,6 +158,8 @@ def validate_checkpoint_compatibility(checkpoint, run_cfg):
             raise ValueError(f"Checkpoint model_config missing required key: {key}")
         if ckpt_cfg[key] != run_cfg[key]:
             raise ValueError(_as_config_error(key, ckpt_cfg[key], run_cfg[key]))
+    if "use_pos_weight" in ckpt_cfg and ckpt_cfg["use_pos_weight"] != run_cfg.get("use_pos_weight"):
+        raise ValueError(_as_config_error("use_pos_weight", ckpt_cfg.get("use_pos_weight"), run_cfg.get("use_pos_weight")))
 
 
 def _materialize_debug_sample(dataset, idx, seed):
@@ -208,7 +219,7 @@ def make_dataloaders(args):
     train_loader = DataLoader(
         train_set,
         batch_size=effective_batch_size,
-        shuffle=False,
+        shuffle=not args.debug_one_object,
         num_workers=args.num_workers,
         drop_last=False,
     )
@@ -233,6 +244,7 @@ def run_epoch(
         checkpoint_callback=None,
         kl_weight=0.1,
         return_grad_stats=False,
+        use_pos_weight=True,
 ):
     """optimizer=None runs a validation pass instead of a training pass."""
     is_train = optimizer is not None
@@ -262,7 +274,7 @@ def run_epoch(
                     if "occupancy" == (getattr(model, "target_mode", "occupancy"))
                     else batch["sdf_labels"].to(device)
                 )
-                if "occupancy" == getattr(model, "target_mode", "occupancy") and getattr(model, "use_pos_weight", True):
+                if "occupancy" == getattr(model, "target_mode", "occupancy") and bool(use_pos_weight):
                     n_pos = labels.sum().clamp(min=1.0)
                     n_neg = (labels.numel() - labels.sum()).clamp(min=1.0)
                     pos_weight = (n_neg / n_pos).detach()
@@ -519,6 +531,10 @@ def evaluate_dense_grid_occupancy(model, sample, device, resolution=48, threshol
     pred_occ = probs >= threshold
     if pred_occ.size == 0:
         raise ValueError("Predicted occupancy mask is empty.")
+    if gt_occ.size == 0 or not np.isfinite(gt_occ).all():
+        raise ValueError("Ground-truth occupancy mask is empty or invalid.")
+    if gt_occ.sum() == 0:
+        raise ValueError("Ground-truth occupancy mask has zero occupied voxels on the dense grid; dense IoU is undefined.")
 
     if not (probs.min() < threshold < probs.max()):
         raise RuntimeError(
@@ -531,7 +547,7 @@ def evaluate_dense_grid_occupancy(model, sample, device, resolution=48, threshol
     pred_pos = float(pred_occ.sum())
     gt_pos = float(gt_occ.sum())
     dense_iou = inter / max(union, 1.0)
-    precision = inter / max(pred_pos, 1.0)
+    precision = inter / max(pred_pos, 1.0) if pred_pos > 0 else 0.0
     recall = inter / max(gt_pos, 1.0)
     occupied_fraction = float(pred_occ.mean())
     gt_occupied_fraction = float(gt_occ.mean())
@@ -562,6 +578,8 @@ def evaluate_dense_grid_occupancy(model, sample, device, resolution=48, threshol
         "dense_iou": dense_iou,
         "precision": precision,
         "recall": recall,
+        "intersection": inter,
+        "union": union,
         "occupied_fraction": occupied_fraction,
         "ground_truth_occupied_fraction": gt_occupied_fraction,
         "predicted_occupied_fraction": occupied_fraction,
@@ -592,6 +610,7 @@ def main():
         freq_scale=args.freq_scale,
         target_mode=args.target_mode,
         decode_mode=args.decode_mode,
+        use_pos_weight=args.use_pos_weight,
     ).to(device)
     model_cfg = build_vae_config(args)
 
@@ -641,7 +660,7 @@ def main():
     for epoch in range(start_epoch, args.epochs + 1):
         current_kl_weight = args.kl_weight * min(1.0, epoch / max(args.kl_warmup_epochs, 1))
         print(
-            f"starting epoch {epoch}/{args.epochs} (kl_weight={current_kl_weight:.6f})",
+            f"starting epoch {epoch}/{args.epochs} (kl_weight={current_kl_weight:.6f}, use_pos_weight={args.use_pos_weight}, target_mode={args.target_mode}, decode_mode={args.decode_mode})",
             flush=True,
         )
         train_loss, train_recon, train_kl, optimizer_updates, grad_stats = run_epoch(
@@ -660,10 +679,15 @@ def main():
             ),
             kl_weight=current_kl_weight,
             return_grad_stats=bool(args.debug_one_object),
+            use_pos_weight=args.use_pos_weight,
         )
         resume_step = 0
         val_loss, val_recon, val_kl = run_epoch(
-            model, val_loader, device, kl_weight=current_kl_weight
+            model,
+            val_loader,
+            device,
+            kl_weight=current_kl_weight,
+            use_pos_weight=args.use_pos_weight,
         )
         val_metrics = compute_validation_metrics(model, val_loader, device)
 
@@ -732,7 +756,7 @@ def main():
                     f"prob_std={dense['prob_stats']['std']:.6f} "
                     f"prob_min={dense['prob_stats']['min']:.6f} "
                     f"prob_max={dense['prob_stats']['max']:.6f} "
-                    f"voxel_regions={dense['voxel_regions']} "
+                    f"voxel_regions={dense['voxel_connected_regions']} "
                     f"mesh_components={dense['mesh_components']}",
                     flush=True,
                 )
