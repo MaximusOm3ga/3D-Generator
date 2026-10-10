@@ -22,6 +22,7 @@ def parse_args():
     p.add_argument("--vae-ckpt", type=str, default="checkpoints/vae_best.pt")
     p.add_argument("--cache-dir", type=str, default="cached_objects")
     p.add_argument("--resolution", type=int, default=48)
+    p.add_argument("--debug-object-index", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -44,12 +45,15 @@ def main():
     target_mode = checkpoint.get("target_mode", "occupancy")
     if target_mode != "occupancy":
         raise ValueError(f"Checkpoint target_mode={target_mode!r} is incompatible with the current occupancy-only VAE path.")
+    model_cfg = checkpoint.get("model_config", {})
     print(f"Loaded checkpoint from epoch {epoch} (target={target_mode})")
 
     model = SkeletalVAE(
         embed_dim=train_args.get("embed_dim", 128),
         latent_dim=train_args.get("latent_dim", 64),
+        freq_scale=train_args.get("freq_scale", 8.0),
         target_mode=train_args.get("target_mode", "occupancy"),
+        decode_mode=model_cfg.get("decode_mode", train_args.get("decode_mode", "stochastic")),
     ).to(device)
     model.load_state_dict(state, strict=True)
 
@@ -58,7 +62,9 @@ def main():
         n_surface_points=train_args.get("n_surface_points", 2048),
         n_query_points=train_args.get("n_query_points", 1024),
     )
-    loader = DataLoader(ds, batch_size=1, shuffle=True, num_workers=0)
+    debug_idx = min(max(args.debug_object_index, 0), len(ds) - 1)
+    sample = ds[debug_idx]
+    loader = DataLoader([sample], batch_size=1, shuffle=False, num_workers=0)
 
     check_reconstruction(model, loader, device, epoch=f"checkpoint_{epoch}", resolution=args.resolution)
 

@@ -45,7 +45,9 @@ def main():
     model = SkeletalVAE(
         embed_dim=train_args.get("embed_dim", 128),
         latent_dim=train_args.get("latent_dim", 64),
+        freq_scale=train_args.get("freq_scale", 8.0),
         target_mode=train_args.get("target_mode", "occupancy"),
+        decode_mode=train_args.get("decode_mode", "stochastic"),
     ).to(device)
     model.load_state_dict(state, strict=True)
     model.eval()
@@ -72,14 +74,8 @@ def main():
                     enabled=(args.amp and device == "cuda"),
             ):
                 mean, logvar = model.encode(xyz, skeleton_points)
-                # Cache a reparameterized SAMPLE, not the raw mean. Confirmed
-                # via check_vae_now.py: [mean] decoding still fails (globally
-                # biased, no usable threshold crossing) while [sample]
-                # decoding works correctly -- the decoder was only ever
-                # trained on samples, so that's what the DiT should learn to
-                # generate too. Standard practice for latent diffusion models
-                # built on a VAE (e.g. Stable Diffusion trains on encoder
-                # samples, not the deterministic mean).
+                # Keep production latent convention unchanged for diffusion:
+                # cache posterior means as deterministic per-object latents.
                 latents = mean.float().cpu().numpy()
 
             for i in range(latents.shape[0]):

@@ -5,10 +5,14 @@ import torch
 from torch.utils.data import DataLoader, Subset, random_split
 from skimage import measure
 import trimesh
+from scipy import ndimage
 
 from dataset import SkeletalMeshDataset
 from vae_model import SkeletalVAE, vae_loss
 from checkpoint_utils import atomic_torch_save, capture_rng_state, restore_rng_state
+
+
+SUPPORTED_ARCHITECTURE = "skeletal_vae_legacy_v2"
 
 
 def parse_args():
@@ -32,6 +36,13 @@ def parse_args():
     )
     p.add_argument("--embed-dim", type=int, default=128)
     p.add_argument("--latent-dim", type=int, default=64)
+    p.add_argument(
+        "--decode-mode",
+        type=str,
+        choices=["stochastic", "mean"],
+        default="stochastic",
+        help="Latent decoding mode during training/evaluation. 'mean' uses posterior mean deterministically.",
+    )
     p.add_argument(
         "--kl-weight",
         type=float,
@@ -93,6 +104,45 @@ def parse_args():
              "you've confirmed your environment's /dev/shm can handle it.",
     )
     return p.parse_args()
+
+
+def ensure_target_mode_supported(args):
+    if args.target_mode != "occupancy":
+        raise ValueError(
+            "SDF mode is currently disabled because the training/evaluation path is incomplete: "
+            "run_epoch()/validation metrics assume occupancy labels and checkpoint metadata previously "
+            "hardcoded occupancy values. Keep --target-mode occupancy until full end-to-end SDF support is implemented."
+        )
+
+
+def build_vae_config(args):
+    return {
+        "architecture": SUPPORTED_ARCHITECTURE,
+        "embed_dim": int(args.embed_dim),
+        "latent_dim": int(args.latent_dim),
+        "freq_scale": float(args.freq_scale),
+        "target_mode": str(args.target_mode).lower(),
+        "decode_mode": str(args.decode_mode).lower(),
+    }
+
+
+def _as_config_error(key, ckpt_value, run_value):
+    return f"Checkpoint incompatible: {key} mismatch (checkpoint={ckpt_value!r}, current={run_value!r})"
+
+
+def validate_checkpoint_compatibility(checkpoint, run_cfg):
+    ckpt_cfg = checkpoint.get("model_config")
+    if ckpt_cfg is None:
+        raise ValueError(
+            "Checkpoint missing model_config metadata and cannot be safely resumed with current compatibility checks."
+        )
+    if ckpt_cfg.get("architecture") != run_cfg["architecture"]:
+        raise ValueError(_as_config_error("architecture", ckpt_cfg.get("architecture"), run_cfg["architecture"]))
+    for key in ("embed_dim", "latent_dim", "freq_scale", "target_mode", "decode_mode"):
+        if key not in ckpt_cfg:
+            raise ValueError(f"Checkpoint model_config missing required key: {key}")
+        if ckpt_cfg[key] != run_cfg[key]:
+            raise ValueError(_as_config_error(key, ckpt_cfg[key], run_cfg[key]))
 
 
 def make_dataloaders(args):
@@ -163,6 +213,7 @@ def run_epoch(
         start_step=0,
         checkpoint_callback=None,
         kl_weight=0.1,
+        return_grad_stats=False,
 ):
     """optimizer=None runs a validation pass instead of a training pass."""
     is_train = optimizer is not None
@@ -171,6 +222,7 @@ def run_epoch(
     total_loss, total_recon, total_kl, n_batches = 0.0, 0.0, 0.0, 0
     optimizer_updates = 0
     accum_steps_done = 0
+    grad_stats = None
 
     if is_train:
         optimizer.zero_grad()
@@ -216,6 +268,8 @@ def run_epoch(
             accum_steps_done += 1
 
             if accum_steps_done == accum_steps:
+                if return_grad_stats and grad_stats is None:
+                    grad_stats = collect_grad_stats(model)
                 if scaler is not None:
                     scaler.step(optimizer)
                     scaler.update()
@@ -238,6 +292,8 @@ def run_epoch(
             )
 
     if is_train and accum_steps_done > 0:
+        if return_grad_stats and grad_stats is None:
+            grad_stats = collect_grad_stats(model)
         if scaler is not None:
             scaler.step(optimizer)
             scaler.update()
@@ -257,7 +313,39 @@ def run_epoch(
             flush=True,
         )
     print(f"  optimizer updates this epoch: {optimizer_updates}", flush=True)
+    if return_grad_stats:
+        return total_loss / n_batches, total_recon / n_batches, total_kl / n_batches, optimizer_updates, grad_stats
     return total_loss / n_batches, total_recon / n_batches, total_kl / n_batches
+
+
+def collect_grad_stats(model):
+    enc_total, enc_with_grad, enc_norm_sq = 0, 0, 0.0
+    dec_total, dec_with_grad, dec_norm_sq = 0, 0, 0.0
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith("encoder."):
+            enc_total += 1
+            if p.grad is not None:
+                enc_with_grad += 1
+                enc_norm_sq += float(p.grad.detach().norm().item() ** 2)
+        elif name.startswith("decoder."):
+            dec_total += 1
+            if p.grad is not None:
+                dec_with_grad += 1
+                dec_norm_sq += float(p.grad.detach().norm().item() ** 2)
+    return {
+        "encoder": {
+            "with_grad": enc_with_grad,
+            "total": enc_total,
+            "grad_norm": float(enc_norm_sq ** 0.5),
+        },
+        "decoder": {
+            "with_grad": dec_with_grad,
+            "total": dec_total,
+            "grad_norm": float(dec_norm_sq ** 0.5),
+        },
+    }
 
 
 def compute_validation_metrics(model, val_loader, device, max_batches=3):
@@ -317,17 +405,21 @@ def _decode_grid_and_report(model, latent, label, device, epoch, resolution, run
     )
 
     try:
-        verts, faces, _, _ = measure.marching_cubes(occupancy_np, level=0.5)
-        out_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        verts_voxel, faces, _, _ = measure.marching_cubes(occupancy_np, level=0.5)
+        scale = 2.0 / (resolution - 1)
+        verts_world = verts_voxel * scale - 1.0
+        out_mesh = trimesh.Trimesh(vertices=verts_world, faces=faces, process=False)
         occupied = occupancy_np > 0.5
         if occupied.any():
-            labels, connected = measure.label(occupied, return_num=True)
-            connected = int(connected)
+            _, connected = ndimage.label(occupied)
+            voxel_regions = int(connected)
         else:
-            connected = 0
+            voxel_regions = 0
+        mesh_components = int(len(out_mesh.split(only_watertight=False)))
         print(
             f"  [{label}] extraction: vertices={len(out_mesh.vertices)} faces={len(out_mesh.faces)} "
-            f"connected_components={connected} finite={np.isfinite(out_mesh.vertices).all()}"
+            f"voxel_connected_regions={voxel_regions} mesh_components={mesh_components} "
+            f"finite={np.isfinite(out_mesh.vertices).all()}"
         )
         os.makedirs("reconstructions", exist_ok=True)
         suffix = f"_{run_id}" if run_id else ""
@@ -366,8 +458,73 @@ def check_reconstruction(model, val_loader, device, epoch, resolution=48, run_id
         _decode_grid_and_report(model, sampled_z, "sample", device, epoch, resolution, run_id)
 
 
+@torch.no_grad()
+def evaluate_dense_grid_occupancy(model, sample, device, resolution=48):
+    mesh = trimesh.Trimesh(
+        vertices=sample["mesh_vertices"],
+        faces=sample["mesh_faces"],
+        process=False,
+    )
+    grid_coords = np.linspace(-1.0, 1.0, num=resolution, dtype=np.float32)
+    gx, gy, gz = np.meshgrid(grid_coords, grid_coords, grid_coords, indexing="ij")
+    grid_np = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3).astype(np.float32)
+
+    surface_xyz = torch.from_numpy(sample["surface_xyz"][None]).to(device)
+    skeleton_points = torch.from_numpy(sample["skeleton_points"][None]).to(device)
+    query = torch.from_numpy(grid_np[None]).to(device)
+
+    mean, logvar = model.encode(surface_xyz, skeleton_points)
+    latent = mean if model.decode_mode == "mean" else model.reparameterize(mean, logvar)
+    logits = model.decoder(query, latent)
+    probs = torch.sigmoid(logits).reshape(-1).cpu().numpy()
+    pred_occ = probs >= 0.5
+    gt_occ = mesh.contains(grid_np)
+
+    inter = float(np.logical_and(pred_occ, gt_occ).sum())
+    union = float(np.logical_or(pred_occ, gt_occ).sum())
+    pred_pos = float(pred_occ.sum())
+    gt_pos = float(gt_occ.sum())
+    dense_iou = inter / max(union, 1.0)
+    precision = inter / max(pred_pos, 1.0)
+    recall = inter / max(gt_pos, 1.0)
+    occupied_fraction = float(pred_occ.mean())
+    probs_stats = {
+        "mean": float(probs.mean()),
+        "std": float(probs.std()),
+        "min": float(probs.min()),
+        "max": float(probs.max()),
+    }
+
+    occ_grid = probs.reshape(resolution, resolution, resolution)
+    voxel_binary = occ_grid >= 0.5
+    if voxel_binary.any():
+        _, voxel_regions = ndimage.label(voxel_binary)
+        voxel_regions = int(voxel_regions)
+    else:
+        voxel_regions = 0
+
+    mesh_components = 0
+    if probs.min() < 0.5 < probs.max():
+        verts_voxel, faces, _, _ = measure.marching_cubes(occ_grid, level=0.5)
+        scale = 2.0 / (resolution - 1)
+        verts_world = verts_voxel * scale - 1.0
+        mesh_pred = trimesh.Trimesh(vertices=verts_world, faces=faces, process=False)
+        mesh_components = int(len(mesh_pred.split(only_watertight=False)))
+
+    return {
+        "dense_iou": dense_iou,
+        "precision": precision,
+        "recall": recall,
+        "occupied_fraction": occupied_fraction,
+        "prob_stats": probs_stats,
+        "voxel_regions": voxel_regions,
+        "mesh_components": mesh_components,
+    }
+
+
 def main():
     args = parse_args()
+    ensure_target_mode_supported(args)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     if args.amp and device != "cuda":
@@ -379,19 +536,18 @@ def main():
     model = SkeletalVAE(
         embed_dim=args.embed_dim,
         latent_dim=args.latent_dim,
+        freq_scale=args.freq_scale,
         target_mode=args.target_mode,
+        decode_mode=args.decode_mode,
     ).to(device)
+    model_cfg = build_vae_config(args)
 
     start_epoch = 1
     best_val_loss = float("inf")
     if args.resume and os.path.exists(args.resume):
         print(f"Resuming from {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-        target_mode = checkpoint.get("target_mode", "occupancy")
-        if target_mode != "occupancy":
-            raise ValueError(
-                f"Checkpoint target_mode={target_mode!r} is incompatible with this occupancy-only training path."
-            )
+        validate_checkpoint_compatibility(checkpoint, model_cfg)
         model.load_state_dict(checkpoint["model_state"])
         start_epoch = checkpoint.get("epoch", 0)
         if checkpoint.get("batch_step", 0) == 0:
@@ -420,8 +576,9 @@ def main():
                 "epoch": epoch,
                 "batch_step": batch_step,
                 "best_val_loss": best_loss,
-                "target_mode": "occupancy",
-                "architecture": "skeletal_vae_legacy",
+                "target_mode": model_cfg["target_mode"],
+                "architecture": model_cfg["architecture"],
+                "model_config": model_cfg,
                 "args": vars(args),
                 "rng_state": capture_rng_state(),
             },
@@ -434,7 +591,7 @@ def main():
             f"starting epoch {epoch}/{args.epochs} (kl_weight={current_kl_weight:.6f})",
             flush=True,
         )
-        train_loss, train_recon, train_kl = run_epoch(
+        train_loss, train_recon, train_kl, optimizer_updates, grad_stats = run_epoch(
             model,
             train_loader,
             device,
@@ -449,6 +606,7 @@ def main():
                 else None
             ),
             kl_weight=current_kl_weight,
+            return_grad_stats=bool(args.debug_one_object),
         )
         resume_step = 0
         val_loss, val_recon, val_kl = run_epoch(
@@ -466,6 +624,16 @@ def main():
             f"pred_ratio {val_metrics['pred_occupancy_ratio']:.4f} "
             f"latent_std {val_metrics['latent_std']:.4f}"
         )
+        if args.debug_one_object and grad_stats is not None:
+            print(
+                "  gradient coverage | "
+                f"encoder {grad_stats['encoder']['with_grad']}/{grad_stats['encoder']['total']} "
+                f"(norm={grad_stats['encoder']['grad_norm']:.6f}) | "
+                f"decoder {grad_stats['decoder']['with_grad']}/{grad_stats['decoder']['total']} "
+                f"(norm={grad_stats['decoder']['grad_norm']:.6f}) | "
+                f"optimizer_updates={optimizer_updates}",
+                flush=True,
+            )
 
         checkpoint = {
             "model_state": model.state_dict(),
@@ -474,8 +642,9 @@ def main():
             "epoch": epoch,
             "batch_step": 0,
             "best_val_loss": best_val_loss,
-            "target_mode": "occupancy",
-            "architecture": "skeletal_vae_legacy",
+            "target_mode": model_cfg["target_mode"],
+            "architecture": model_cfg["architecture"],
+            "model_config": model_cfg,
             "args": vars(args),
             "rng_state": capture_rng_state(),
         }
@@ -488,6 +657,32 @@ def main():
 
         if epoch % args.check_every == 0:
             check_reconstruction(model, val_loader, device, epoch)
+            if args.debug_one_object:
+                batch = next(iter(val_loader))
+                index = 0 if not isinstance(val_loader.dataset, Subset) else val_loader.dataset.indices[0]
+                obj_path = train_loader.dataset.dataset.paths[index] if isinstance(train_loader.dataset, Subset) else train_loader.dataset.paths[index]
+                obj_data = np.load(obj_path)
+                sample = {
+                    "surface_xyz": batch["surface_xyz"][0].cpu().numpy(),
+                    "skeleton_points": batch["skeleton_points"][0].cpu().numpy(),
+                    "mesh_vertices": obj_data["mesh_vertices"],
+                    "mesh_faces": obj_data["mesh_faces"],
+                }
+                dense = evaluate_dense_grid_occupancy(model, sample, device, resolution=48)
+                print(
+                    "  dense-grid eval | "
+                    f"iou={dense['dense_iou']:.6f} "
+                    f"precision={dense['precision']:.6f} "
+                    f"recall={dense['recall']:.6f} "
+                    f"occupied_fraction={dense['occupied_fraction']:.6f} "
+                    f"prob_mean={dense['prob_stats']['mean']:.6f} "
+                    f"prob_std={dense['prob_stats']['std']:.6f} "
+                    f"prob_min={dense['prob_stats']['min']:.6f} "
+                    f"prob_max={dense['prob_stats']['max']:.6f} "
+                    f"voxel_regions={dense['voxel_regions']} "
+                    f"mesh_components={dense['mesh_components']}",
+                    flush=True,
+                )
 
     print(f"Training done. Best val loss: {best_val_loss:.4f}")
     print(f"Best checkpoint: {os.path.join(args.checkpoint_dir, 'vae_best.pt')}")

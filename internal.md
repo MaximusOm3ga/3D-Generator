@@ -1,54 +1,110 @@
-Run flow now:
+Current repo flow (working local ModelNet40 / airplane path)
 
-1. Prepare ModelNet40 airplane meshes/skeletons (default local Kaggle dataset path)
-    python3 prepare_data.py --source modelnet --dataset-root /home/th3suarez/Downloads/archive/ModelNet40 --category airplane --split train --max-objects 3000
-    Optional: use the test split with --split test or --split all.
-2. Train the VAE
-    python3 train_vae.py --cache-dir cached_objects
-    Resume after a stop or OOM:
-    python3 train_vae.py --cache-dir cached_objects --resume checkpoints/vae_last.pt
-3. Freeze + encode latents
-    python3 encode_latents.py --vae-ckpt checkpoints/vae_best.pt --out-dir cached_latents
-4. Train the DiT
-    python3 train_dit.py --manifest data/manifest.jsonl --latent-dir cached_latents --condition-dir conditions --split train
-    Resume after a stop or OOM:
-    python3 train_dit.py --manifest data/manifest.jsonl --latent-dir cached_latents --condition-dir conditions --split train --resume checkpoints/dit_last.pt
-5. Sample a latent and decode to mesh
-    ◦
-    This still needs a small sampler script (sample_dit.py) if you want end-to-end generation from prompt/image.
-    ◦
-    The current pieces already cover training and data wiring; sampling is the next missing step.
+Data flow:
+cached_objects (ModelNet40 airplane .off -> .npz cache) -> VAE -> cached_latents -> DiT -> generated mesh
 
-Data flow: cached_objects (ModelNet40 category) → VAE → cached_latents (+ conditions) → DiT → decoder → mesh.
+1. Prepare ModelNet40 airplane cache
+   python3 prepare_data.py \
+     --source modelnet \
+     --dataset-root /home/th3suarez/Downloads/archive/ModelNet40 \
+     --category airplane \
+     --split train
 
-1.  python3 prepare_data.py
-2.  python3 train_vae.py --n-surface-points 2048 --n-query-points 1024 --batch-size 1 --accum-steps 8 --amp
-3.  python3 encode_latents.py --vae-ckpt checkpoints/vae_best.pt --out-dir cached_latents
-4.  python3 train_dit.py   --manifest data/manifest_latents_only.jsonl   --latent-dir cached_latents   --condition-dir conditions   --split train
+   Notes:
+   - ModelNet mode scans every .off file under the selected category/split.
+   - `--max-objects` is ignored in ModelNet mode; the local dataset is intentionally processed in full.
+   - Use `--split test` or `--split all` if you want to include the alternate split.
 
+2. Train the skeletal VAE
+   python3 train_vae.py \
+     --cache-dir cached_objects \
+     --checkpoint-dir checkpoints \
+     --epochs 200 \
+     --batch-size 1 \
+     --n-surface-points 4096 \
+     --n-query-points 2048 \
+     --accum-steps 1 \
+     --check-every 10 \
+     --seed 42
 
-Resume commands:
-python train_vae.py --resume checkpoints/vae_last.pt
-python train_dit.py --manifest data/manifest.jsonl --latent-dir cached_latents --condition-dir conditions --split train --resume checkpoints/dit_last.pt
+   Useful debug / diagnostic flags:
+   python3 train_vae.py \
+     --cache-dir cached_objects \
+     --checkpoint-dir checkpoints \
+     --epochs 1 \
+     --batch-size 1 \
+     --n-surface-points 512 \
+     --n-query-points 256 \
+     --accum-steps 1 \
+     --check-every 1 \
+     --debug-one-object \
+     --debug-object-index 0 \
+     --kl-weight 0.0 \
+     --kl-warmup-epochs 1
 
-Validation:
+   SDF experiment mode:
+   python3 train_vae.py \
+     --cache-dir cached_objects \
+     --target-mode sdf \
+     --sdf-scale 1.0 \
+     --batch-size 1
 
-Python compilation passed.
-Atomic checkpoint round-trip passed.
-DiT CLI options verified.
-VAE CLI verification was blocked because the active Python environment lacks skimage; this is an existing environment dependency issue.
+   Resume a VAE run:
+   python3 train_vae.py \
+     --cache-dir cached_objects \
+     --checkpoint-dir checkpoints \
+     --resume checkpoints/vae_last.pt
 
+3. Check a trained VAE checkpoint directly
+   python3 check_vae_now.py \
+     --vae-ckpt checkpoints/vae_best.pt \
+     --cache-dir cached_objects \
+     --resolution 48
 
-Low mem train VAE 
-python3 train_dit.py \
-  --manifest data/manifest_from_cached_latents.jsonl \
-  --latent-dir cached_latents \
-  --condition-dir conditions \
-  --split train \
-  --batch-size 1 \
-  --checkpoint-every-steps 100
+   Important: this expects a `.pt` checkpoint, not an exported `.obj` mesh.
 
+4. Encode cached VAE latents
+   python3 encode_latents.py \
+     --vae-ckpt checkpoints/vae_best.pt \
+     --out-dir cached_latents
 
-python3 sample_dit.py   --dit-ckpt checkpoints/dit_last.pt   --vae-ckpt checkpoints/vae_best.pt   --out-dir samples   --num-samples 4   --cfg-scale 1.0   --resolution 64
+5. Train the DiT on cached latents
+   python3 train_dit.py \
+     --manifest data/manifest.jsonl \
+     --latent-dir cached_latents \
+     --condition-dir conditions \
+     --split train \
+     --batch-size 1 \
+     --checkpoint-every-steps 100
 
-python render_obj.py samples/sample_001.obj --out sample_001.png
+   Notes:
+   - If `data/manifest.jsonl` is missing, the current loader can infer entries from `cached_latents` automatically.
+   - `--manifest` still works as the explicit file path when you want to keep a custom manifest.
+
+   Resume a DiT run:
+   python3 train_dit.py \
+     --manifest data/manifest.jsonl \
+     --latent-dir cached_latents \
+     --condition-dir conditions \
+     --split train \
+     --resume checkpoints/dit_last.pt
+
+6. Sample generated meshes
+   python3 sample_dit.py \
+     --dit-ckpt checkpoints/dit_last.pt \
+     --vae-ckpt checkpoints/vae_best.pt \
+     --out-dir samples \
+     --num-samples 4 \
+     --cfg-scale 1.0 \
+     --resolution 128 \
+     --threshold 0.3 \
+     --decode-batch-points 32768
+
+7. Render a sampled mesh
+   python3 render_obj.py samples/sample_001.obj --out sample_001.png
+
+Validation / notes
+- Python compilation is passing for the VAE/data path after the reconstruction fixes.
+- Single-object debug training works and exports dense reconstruction meshes to `reconstructions/`.
+- The discrete `--target-mode occupancy|sdf` VAE path is now explicit; occupancy remains the default.
+- The current architecture is still optimized toward a single airplane category before generalizing to broader ModelNet training.

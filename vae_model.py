@@ -117,7 +117,14 @@ class OccupancyDecoder(nn.Module):
 
 
 class SkeletalVAE(nn.Module):
-    def __init__(self, embed_dim=128, latent_dim=64, freq_scale=8.0, target_mode="occupancy"):
+    def __init__(
+        self,
+        embed_dim=128,
+        latent_dim=64,
+        freq_scale=8.0,
+        target_mode="occupancy",
+        decode_mode="stochastic",
+    ):
         super().__init__()
         self.encoder = SkeletonQueryEncoder(
             embed_dim=embed_dim, latent_dim=latent_dim, freq_scale=freq_scale
@@ -126,6 +133,11 @@ class SkeletalVAE(nn.Module):
             latent_dim=latent_dim, embed_dim=embed_dim, freq_scale=freq_scale
         )
         self.target_mode = str(target_mode).lower()
+        self.decode_mode = str(decode_mode).lower()
+        if self.decode_mode not in {"stochastic", "mean"}:
+            raise ValueError(
+                f"Unsupported decode_mode={self.decode_mode!r}. Expected 'stochastic' or 'mean'."
+            )
 
     def encode(self, surface_points, skeleton_points):
         return self.encoder(surface_points, skeleton_points)
@@ -136,7 +148,10 @@ class SkeletalVAE(nn.Module):
 
     def forward(self, surface_points, skeleton_points, query_points):
         mean, logvar = self.encode(surface_points, skeleton_points)
-        latent_tokens = self.reparameterize(mean, logvar)
+        if self.decode_mode == "mean":
+            latent_tokens = mean
+        else:
+            latent_tokens = self.reparameterize(mean, logvar)
         field = self.decoder(query_points, latent_tokens)
         return field, mean, logvar
 
