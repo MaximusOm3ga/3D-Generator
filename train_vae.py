@@ -44,6 +44,12 @@ def parse_args():
         help="Latent decoding mode during training/evaluation. 'mean' uses posterior mean deterministically.",
     )
     p.add_argument(
+        "--use-pos-weight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use dynamic positive-class weighting in BCE. Disable to use unweighted BCE.",
+    )
+    p.add_argument(
         "--kl-weight",
         type=float,
         default=0.1,
@@ -145,6 +151,16 @@ def validate_checkpoint_compatibility(checkpoint, run_cfg):
             raise ValueError(_as_config_error(key, ckpt_cfg[key], run_cfg[key]))
 
 
+def _materialize_debug_sample(dataset, idx, seed):
+    rng_state = np.random.get_state()
+    try:
+        np.random.seed(seed)
+        sample = dataset[idx]
+    finally:
+        np.random.set_state(rng_state)
+    return sample
+
+
 def make_dataloaders(args):
     full_dataset = SkeletalMeshDataset(
         cache_dir=args.cache_dir,
@@ -160,12 +176,15 @@ def make_dataloaders(args):
 
     if args.debug_one_object:
         idx = min(max(args.debug_object_index, 0), len(full_dataset) - 1)
-        train_set = val_set = Subset(full_dataset, [idx])
-        effective_batch_size = min(args.batch_size, max(1, len(train_set)))
+        fixed_sample = _materialize_debug_sample(full_dataset, idx, args.seed)
+        train_set = val_set = [fixed_sample]
+        effective_batch_size = 1
         print(
             f"DEBUG one-object mode: using cached object index {idx} ({full_dataset.paths[idx]}) "
-            f"for both train and validation."
+            f"for both train and validation with fixed sample points and labels."
         )
+        if fixed_sample.get("occupancy_labels") is None:
+            raise ValueError("Debug-one-object mode requires occupancy labels to be present in the fixed sample.")
     else:
         n_val = max(1, int(0.1 * len(full_dataset)))
         n_train = len(full_dataset) - n_val
@@ -243,7 +262,7 @@ def run_epoch(
                     if "occupancy" == (getattr(model, "target_mode", "occupancy"))
                     else batch["sdf_labels"].to(device)
                 )
-                if "occupancy" == getattr(model, "target_mode", "occupancy"):
+                if "occupancy" == getattr(model, "target_mode", "occupancy") and getattr(model, "use_pos_weight", True):
                     n_pos = labels.sum().clamp(min=1.0)
                     n_neg = (labels.numel() - labels.sum()).clamp(min=1.0)
                     pos_weight = (n_neg / n_pos).detach()
@@ -385,7 +404,7 @@ def compute_validation_metrics(model, val_loader, device, max_batches=3):
     return {k: float(np.mean(v)) if v else 0.0 for k, v in metrics.items()}
 
 
-def _decode_grid_and_report(model, latent, label, device, epoch, resolution, run_id=None):
+def _decode_grid_and_report(model, latent, label, device, epoch, resolution, run_id=None, threshold=0.5):
     grid_coords = torch.linspace(-1, 1, resolution, device=device)
     grid = torch.stack(
         torch.meshgrid(grid_coords, grid_coords, grid_coords, indexing="ij"), dim=-1
@@ -396,7 +415,19 @@ def _decode_grid_and_report(model, latent, label, device, epoch, resolution, run
     occupancy = torch.sigmoid(logits).reshape(resolution, resolution, resolution)
     occupancy_np = occupancy.cpu().numpy()
 
-    occupied_fraction = float(np.mean(occupancy_np > 0.5))
+    if not np.isfinite(occupancy_np).all():
+        raise ValueError(f"[{label}] occupancy field contains NaN/Inf on the dense grid")
+    occupied = occupancy_np >= threshold
+    if not occupied.any() and not (occupancy_np.min() < threshold < occupancy_np.max()):
+        print(f"  [{label}] threshold={threshold:.3f} not crossed: min={occupancy_np.min():.6f} max={occupancy_np.max():.6f}")
+        return
+    if not (occupancy_np.min() < threshold < occupancy_np.max()):
+        raise RuntimeError(
+            f"[{label}] field does not cross threshold={threshold:.3f}; min={occupancy_np.min():.6f}, max={occupancy_np.max():.6f}. "
+            "This diagnostic evaluation does not apply automatic threshold fallback."
+        )
+
+    occupied_fraction = float(np.mean(occupied))
     print(
         f"  [{label}] occupied_fraction={occupied_fraction:.3f}, "
         f"mean_prob={occupancy_np.mean():.6f}, std_prob={occupancy_np.std():.6f}, "
@@ -405,13 +436,13 @@ def _decode_grid_and_report(model, latent, label, device, epoch, resolution, run
     )
 
     try:
-        verts_voxel, faces, _, _ = measure.marching_cubes(occupancy_np, level=0.5)
+        verts_voxel, faces, _, _ = measure.marching_cubes(occupancy_np, level=threshold)
         scale = 2.0 / (resolution - 1)
         verts_world = verts_voxel * scale - 1.0
         out_mesh = trimesh.Trimesh(vertices=verts_world, faces=faces, process=False)
-        occupied = occupancy_np > 0.5
-        if occupied.any():
-            _, connected = ndimage.label(occupied)
+        occupied_mask = occupancy_np >= threshold
+        if occupied_mask.any():
+            _, connected = ndimage.label(occupied_mask)
             voxel_regions = int(connected)
         else:
             voxel_regions = 0
@@ -427,16 +458,13 @@ def _decode_grid_and_report(model, latent, label, device, epoch, resolution, run
         out_mesh.export(out_path)
         print(f"  saved {out_path}")
     except (ValueError, RuntimeError) as e:
-        print(f"  [{label}] failed (likely all-in or all-out): {e}")
+        print(f"  [{label}] failed: {e}")
 
 
 def check_reconstruction(model, val_loader, device, epoch, resolution=48, run_id=None):
     """
-    Decodes TWO ways and prints both, to distinguish "model hasn't learned
-    enough yet" from "decoder was only ever trained on noisy (reparameterized)
-    latents and the clean mean is out-of-distribution for it" -- the latter
-    is a real possibility when kl_weight is small enough that logvar isn't
-    well-regularized (watch whether 'mean' and 'sample' results differ a lot).
+    Decodes BOTH posterior mean and a stochastic sample for comparison.
+    The diagnostic path uses the same fixed validation batch across epochs.
     """
     model.eval()
     batch = next(iter(val_loader))
@@ -452,33 +480,51 @@ def check_reconstruction(model, val_loader, device, epoch, resolution=48, run_id
             import time
             run_id = f"{int(time.time())}"
 
-        _decode_grid_and_report(model, mean, "mean", device, epoch, resolution, run_id)
+        _decode_grid_and_report(model, mean, "mean", device, epoch, resolution, run_id, threshold=0.5)
 
         sampled_z = model.reparameterize(mean, logvar)
-        _decode_grid_and_report(model, sampled_z, "sample", device, epoch, resolution, run_id)
+        _decode_grid_and_report(model, sampled_z, "sample", device, epoch, resolution, run_id, threshold=0.5)
 
 
 @torch.no_grad()
-def evaluate_dense_grid_occupancy(model, sample, device, resolution=48):
+def evaluate_dense_grid_occupancy(model, sample, device, resolution=48, threshold=0.5):
+    if "mesh_vertices" not in sample or "mesh_faces" not in sample:
+        raise ValueError("Dense-grid occupancy evaluation requires mesh_vertices and mesh_faces in the sample metadata.")
     mesh = trimesh.Trimesh(
-        vertices=sample["mesh_vertices"],
-        faces=sample["mesh_faces"],
+        vertices=np.asarray(sample["mesh_vertices"], dtype=np.float32),
+        faces=np.asarray(sample["mesh_faces"], dtype=np.int64),
         process=False,
     )
     grid_coords = np.linspace(-1.0, 1.0, num=resolution, dtype=np.float32)
     gx, gy, gz = np.meshgrid(grid_coords, grid_coords, grid_coords, indexing="ij")
     grid_np = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3).astype(np.float32)
 
-    surface_xyz = torch.from_numpy(sample["surface_xyz"][None]).to(device)
-    skeleton_points = torch.from_numpy(sample["skeleton_points"][None]).to(device)
+    if mesh.is_empty:
+        raise ValueError("Ground-truth mesh is empty; dense-grid occupancy is invalid.")
+    gt_occ = mesh.contains(grid_np)
+    if gt_occ.size == 0 or not np.isfinite(gt_occ).all():
+        raise ValueError("Ground-truth occupancy on the normalized grid is invalid or empty.")
+
+    surface_xyz = torch.from_numpy(np.asarray(sample["surface_xyz"], dtype=np.float32)[None]).to(device)
+    skeleton_points = torch.from_numpy(np.asarray(sample["skeleton_points"], dtype=np.float32)[None]).to(device)
     query = torch.from_numpy(grid_np[None]).to(device)
 
     mean, logvar = model.encode(surface_xyz, skeleton_points)
     latent = mean if model.decode_mode == "mean" else model.reparameterize(mean, logvar)
     logits = model.decoder(query, latent)
     probs = torch.sigmoid(logits).reshape(-1).cpu().numpy()
-    pred_occ = probs >= 0.5
-    gt_occ = mesh.contains(grid_np)
+    if not np.isfinite(probs).all():
+        raise ValueError("Predicted occupancy probabilities contain NaN/Inf on the dense grid.")
+
+    pred_occ = probs >= threshold
+    if pred_occ.size == 0:
+        raise ValueError("Predicted occupancy mask is empty.")
+
+    if not (probs.min() < threshold < probs.max()):
+        raise RuntimeError(
+            f"Dense-grid field does not cross threshold={threshold:.3f}; min={probs.min():.6f}, max={probs.max():.6f}. "
+            "No automatic fallback is allowed in diagnostic evaluation."
+        )
 
     inter = float(np.logical_and(pred_occ, gt_occ).sum())
     union = float(np.logical_or(pred_occ, gt_occ).sum())
@@ -488,6 +534,7 @@ def evaluate_dense_grid_occupancy(model, sample, device, resolution=48):
     precision = inter / max(pred_pos, 1.0)
     recall = inter / max(gt_pos, 1.0)
     occupied_fraction = float(pred_occ.mean())
+    gt_occupied_fraction = float(gt_occ.mean())
     probs_stats = {
         "mean": float(probs.mean()),
         "std": float(probs.std()),
@@ -496,7 +543,7 @@ def evaluate_dense_grid_occupancy(model, sample, device, resolution=48):
     }
 
     occ_grid = probs.reshape(resolution, resolution, resolution)
-    voxel_binary = occ_grid >= 0.5
+    voxel_binary = occ_grid >= threshold
     if voxel_binary.any():
         _, voxel_regions = ndimage.label(voxel_binary)
         voxel_regions = int(voxel_regions)
@@ -504,8 +551,8 @@ def evaluate_dense_grid_occupancy(model, sample, device, resolution=48):
         voxel_regions = 0
 
     mesh_components = 0
-    if probs.min() < 0.5 < probs.max():
-        verts_voxel, faces, _, _ = measure.marching_cubes(occ_grid, level=0.5)
+    if occupancy_threshold_is_crossed(occ_grid, threshold):
+        verts_voxel, faces, _, _ = measure.marching_cubes(occ_grid, level=threshold)
         scale = 2.0 / (resolution - 1)
         verts_world = verts_voxel * scale - 1.0
         mesh_pred = trimesh.Trimesh(vertices=verts_world, faces=faces, process=False)
@@ -516,10 +563,16 @@ def evaluate_dense_grid_occupancy(model, sample, device, resolution=48):
         "precision": precision,
         "recall": recall,
         "occupied_fraction": occupied_fraction,
+        "ground_truth_occupied_fraction": gt_occupied_fraction,
+        "predicted_occupied_fraction": occupied_fraction,
         "prob_stats": probs_stats,
-        "voxel_regions": voxel_regions,
+        "voxel_connected_regions": voxel_regions,
         "mesh_components": mesh_components,
     }
+
+
+def occupancy_threshold_is_crossed(occ_grid, threshold):
+    return bool(np.isfinite(occ_grid).all() and np.min(occ_grid) < threshold < np.max(occ_grid))
 
 
 def main():
