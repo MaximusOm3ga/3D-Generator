@@ -172,13 +172,16 @@ def main():
         model.eval()
         val_total = 0.0
         val_n = 0
+        # Reuse the same validation noise/timesteps each epoch so best-checkpoint
+        # selection reflects model changes rather than Monte Carlo noise.
+        val_generator = torch.Generator(device=DEVICE).manual_seed(12345)
         with torch.no_grad():
             for batch in val_loader:
                 z0 = batch["latent"].to(DEVICE)
                 bsz = z0.shape[0]
-                t = torch.randint(0, TIMESTEPS, (bsz,), device=DEVICE)
+                t = torch.randint(0, TIMESTEPS, (bsz,), device=DEVICE, generator=val_generator)
                 a_t = alphas_cumprod[t].view(bsz, 1, 1)
-                eps = torch.randn_like(z0)
+                eps = torch.randn(z0.shape, device=DEVICE, dtype=z0.dtype, generator=val_generator)
                 zt = torch.sqrt(a_t) * z0 + torch.sqrt(1 - a_t) * eps
                 clip_tokens = batch.get("clip_tokens")
                 dino_tokens = batch.get("dino_tokens")
