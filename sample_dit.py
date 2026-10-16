@@ -83,9 +83,15 @@ def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps,
     if sampling_steps > timesteps:
         raise ValueError(f"sampling_steps ({sampling_steps}) cannot exceed timesteps ({timesteps})")
 
+    if sampler.lower() not in {"ddim", "ddpm"}:
+        raise ValueError(f"Unsupported sampler={sampler!r}")
+    if sampler.lower() == "ddpm" and sampling_steps != timesteps:
+        raise ValueError("DDPM requires sampling_steps == timesteps; use DDIM for reduced-step sampling.")
+    if len(shape) != 3 or any(int(v) <= 0 for v in shape):
+        raise ValueError(f"shape must be [batch, tokens, dim] with positive dimensions, got {shape}")
     z = torch.randn(shape, device=device)
     step_indices = torch.linspace(timesteps - 1, 0, steps=sampling_steps, device=device).long()
-    step_indices = torch.unique(step_indices, sorted=False).flip(0)
+    step_indices = torch.unique(step_indices, sorted=True).flip(0)
 
     for i, t_idx in enumerate(step_indices):
         t = torch.full((shape[0],), int(t_idx.item()), device=device, dtype=torch.long)
@@ -102,33 +108,26 @@ def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps,
         sqrt_one_minus_ab_t = torch.sqrt(1.0 - ab_t)
         z0_hat = (z - sqrt_one_minus_ab_t * eps) / sqrt_ab_t
 
-        if i + 1 < len(step_indices):
-            t_prev_val = int(step_indices[i + 1].item())
-        else:
-            t_prev_val = 0
+        t_prev_val = int(step_indices[i + 1].item()) if i + 1 < len(step_indices) else -1
+        if t_prev_val < 0:
+            z = z0_hat
+            continue
         t_prev = torch.full((shape[0],), t_prev_val, device=device, dtype=torch.long)
         ab_prev = alphas_cumprod[t_prev].view(-1, 1, 1).clamp_min(1e-8)
 
         if sampler.lower() == "ddpm":
-            if t_prev_val <= 0:
-                z = z0_hat
-                continue
-            alpha_bar_t = ab_t.clamp_min(1e-8)
-            alpha_bar_prev = ab_prev.clamp_min(1e-8)
-            beta_t = 1.0 - (alpha_bar_t / alpha_bar_prev)
-            posterior_variance = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t).clamp_min(1e-8)
-            posterior_mean = (
-                torch.sqrt(alpha_bar_prev) * z0_hat
-                + torch.sqrt((1.0 - alpha_bar_prev - posterior_variance).clamp_min(0.0)) * eps
-            )
-            noise = torch.randn_like(z)
-            z = posterior_mean + torch.sqrt(posterior_variance.clamp_min(1e-8)) * noise
+            # Adjacent-step DDPM posterior. Reduced-step DDPM is rejected above.
+            beta_t = 1.0 - ab_t / ab_prev
+            alpha_t = 1.0 - beta_t
+            denom = (1.0 - ab_t).clamp_min(1e-8)
+            coef_x0 = torch.sqrt(ab_prev) * beta_t / denom
+            coef_xt = torch.sqrt(alpha_t) * (1.0 - ab_prev) / denom
+            posterior_mean = coef_x0 * z0_hat + coef_xt * z
+            posterior_variance = (beta_t * (1.0 - ab_prev) / denom).clamp_min(0.0)
+            z = posterior_mean + torch.sqrt(posterior_variance) * torch.randn_like(z)
             continue
 
-        if t_prev_val <= 0:
-            z = z0_hat
-            continue
-        sigma_t = ddim_eta * torch.sqrt((1.0 - ab_prev) / (1.0 - ab_t)) * torch.sqrt(1.0 - ab_t / ab_prev)
+        sigma_t = ddim_eta * torch.sqrt(((1.0 - ab_prev) / (1.0 - ab_t)).clamp_min(0.0)) * torch.sqrt((1.0 - ab_t / ab_prev).clamp_min(0.0))
         noise = torch.randn_like(z) if ddim_eta > 0 else torch.zeros_like(z)
         z = (
             torch.sqrt(ab_prev) * z0_hat
@@ -140,6 +139,10 @@ def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps,
 
 @torch.no_grad()
 def decode_to_mesh(vae, latent_tokens, device, resolution=64, threshold=0.5):
+    if resolution < 2:
+        raise ValueError(f"resolution must be >= 2, got {resolution}")
+    if not 0.0 < threshold < 1.0:
+        raise ValueError(f"threshold must be between 0 and 1, got {threshold}")
     grid_coords = torch.linspace(-1, 1, resolution, device=device)
     grid = torch.stack(
         torch.meshgrid(grid_coords, grid_coords, grid_coords, indexing="ij"), dim=-1
@@ -173,6 +176,12 @@ def decode_to_mesh_chunked(
     threshold=0.5,
     decode_batch_points=32768,
 ):
+    if resolution < 2:
+        raise ValueError(f"resolution must be >= 2, got {resolution}")
+    if decode_batch_points <= 0:
+        raise ValueError(f"decode_batch_points must be positive, got {decode_batch_points}")
+    if not 0.0 < threshold < 1.0:
+        raise ValueError(f"threshold must be between 0 and 1, got {threshold}")
     grid_coords = torch.linspace(-1, 1, resolution, device=device)
     grid = torch.stack(
         torch.meshgrid(grid_coords, grid_coords, grid_coords, indexing="ij"), dim=-1
@@ -240,12 +249,16 @@ def main():
 
     betas, alphas, alphas_cumprod = make_schedule(args.timesteps, device)
     clip_tokens, dino_tokens = load_condition(args.condition_path, device)
-    if os.path.exists(args.latent_stats_path):
-        stats_dir = os.path.dirname(args.latent_stats_path) or "."
-        stats_mean, stats_std = load_latent_stats(stats_dir, expected_dim=latent_dim)
-    else:
-        stats_mean = np.zeros(0, dtype=np.float32)
-        stats_std = np.ones(0, dtype=np.float32)
+    if not os.path.exists(args.latent_stats_path):
+        raise FileNotFoundError(
+            f"Training latent normalization statistics are required: {args.latent_stats_path}. "
+            "Run encode_latents.py --split train first; generated latents must be denormalized "
+            "with the same training-only statistics used by DiT."
+        )
+    stats_dir = os.path.dirname(args.latent_stats_path) or "."
+    stats_mean, stats_std = load_latent_stats(stats_dir, expected_dim=latent_dim)
+    if stats_mean.size == 0 or stats_std.size == 0:
+        raise RuntimeError(f"Invalid or empty latent normalization statistics: {args.latent_stats_path}")
 
     for i in range(args.num_samples):
         latent = sample_latent(
