@@ -146,22 +146,47 @@ def export_diagnostic_mesh(mesh, stage, output_dir):
         print(f"[DIAGNOSTIC] Failed to export {stage}: {exc}")
 
 def repair_mesh(path, diagnostic_dir=None):
+    """
+    Clean and normalize a mesh without requiring every component
+    to be watertight.
+
+    Processing order:
+      1. Load the original geometry.
+      2. Merge coincident vertices.
+      3. Remove duplicate faces.
+      4. Remove degenerate faces and unreferenced vertices.
+      5. Decimate the cleaned mesh.
+      6. Center and normalize the mesh.
+    """
+
     try:
-        loaded = trimesh.load(path, force="mesh", process=True)
-    except Exception as e:
-        print(f"  load failed: {e}")
+        loaded = trimesh.load(
+            path,
+            force="mesh",
+            process=False,
+        )
+    except Exception as exc:
+        print(f"  load failed: {exc}")
         return None
 
     if isinstance(loaded, trimesh.Scene):
         geometries = [
-            g for g in loaded.geometry.values()
-            if isinstance(g, trimesh.Trimesh) and len(g.faces) > 0
+            geometry
+            for geometry in loaded.geometry.values()
+            if isinstance(geometry, trimesh.Trimesh)
+            and len(geometry.faces) > 0
         ]
+
         if not geometries:
             return None
+
         loaded = trimesh.util.concatenate(geometries)
 
-    if loaded is None or len(loaded.vertices) == 0 or len(loaded.faces) == 0:
+    if (
+        loaded is None
+        or len(loaded.vertices) == 0
+        or len(loaded.faces) == 0
+    ):
         return None
 
     def export_stage(mesh, stage):
@@ -169,11 +194,13 @@ def repair_mesh(path, diagnostic_dir=None):
             return
 
         if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
-            print(f"  [DIAGNOSTIC] {stage}: empty mesh")
             return
 
         os.makedirs(diagnostic_dir, exist_ok=True)
-        output_path = os.path.join(diagnostic_dir, f"{stage}.ply")
+        output_path = os.path.join(
+            diagnostic_dir,
+            f"{stage}.ply",
+        )
 
         try:
             mesh.export(output_path, file_type="ply")
@@ -181,160 +208,189 @@ def repair_mesh(path, diagnostic_dir=None):
                 f"  [DIAGNOSTIC] {stage}: "
                 f"vertices={len(mesh.vertices)}, "
                 f"faces={len(mesh.faces)}, "
-                f"extents={np.round(mesh.bounding_box.extents, 4)}, "
+                f"components={len(mesh.split(only_watertight=False))}, "
                 f"watertight={mesh.is_watertight}, "
                 f"saved={output_path}"
             )
         except Exception as exc:
             print(f"  [DIAGNOSTIC] Export failed for {stage}: {exc}")
 
-    # Stage 1: mesh as loaded by Trimesh.
     export_stage(loaded, "01_raw_loaded")
 
-    original_extents = np.asarray(
-        loaded.bounding_box.extents, dtype=np.float64
+    # ---------------------------------------------------------
+    # Stage 1: Merge coincident vertices.
+    # ---------------------------------------------------------
+    loaded.merge_vertices(digits_vertex=8)
+    loaded.remove_unreferenced_vertices()
+
+    if len(loaded.faces) == 0:
+        print("  no faces remain after vertex merging")
+        return None
+
+    # ---------------------------------------------------------
+    # Stage 2: Remove duplicate triangles.
+    #
+    # Sorting each triangle's vertex indices makes the comparison
+    # independent of face winding.
+    # ---------------------------------------------------------
+    faces = np.asarray(loaded.faces)
+    canonical_faces = np.sort(faces, axis=1)
+
+    _, first_indices = np.unique(
+        canonical_faces,
+        axis=0,
+        return_index=True,
     )
 
-    # Split disconnected components so repair can be performed separately.
-    components = loaded.split(only_watertight=False)
-    if not components:
-        components = [loaded]
+    keep_faces = np.zeros(len(faces), dtype=bool)
+    keep_faces[first_indices] = True
 
-    decimated_components = []
-    repaired_components = []
+    duplicate_count = int((~keep_faces).sum())
 
-    for component_idx, component in enumerate(components):
-        if len(component.vertices) == 0 or len(component.faces) == 0:
-            continue
+    loaded.update_faces(keep_faces)
+    loaded.remove_unreferenced_vertices()
 
-        # Stage 2: decimation.
-        component = decimate_mesh(component)
-        decimated_components.append(component.copy())
+    print(
+        f"  removed {duplicate_count} duplicate faces; "
+        f"remaining faces={len(loaded.faces)}"
+    )
 
-        candidate = None
-
-        # Stage 3: repair the decimated component.
-        try:
-            fixer = pymeshfix.MeshFix(
-                component.vertices,
-                component.faces,
-            )
-            fixer.repair()
-
-            candidate = trimesh.Trimesh(
-                vertices=np.asarray(fixer.points),
-                faces=np.asarray(fixer.faces),
-                process=True,
-            )
-
-        except Exception as exc:
-            print(
-                f"  component {component_idx}: "
-                f"MeshFix failed: {exc}"
-            )
-
-        if (
-            candidate is not None
-            and len(candidate.vertices) > 0
-            and len(candidate.faces) > 0
-            and candidate.is_watertight
-        ):
-            repaired_components.append(candidate)
-
-        elif component.is_watertight:
-            # Preserve an already-watertight component if repair fails.
-            repaired_components.append(component)
-
-
-        else:
-
-            print(
-
-                f"  component {component_idx} could not be repaired; "
-
-                "exporting diagnostic geometry before rejecting object"
-
-            )
-
-            if diagnostic_dir:
-                export_stage(
-
-                    component,
-
-                    f"02_component_{component_idx}_before_meshfix",
-
-                )
-
-            return None
-
-    if decimated_components:
-        decimated_mesh = trimesh.util.concatenate(decimated_components)
-        export_stage(decimated_mesh, "02_after_decimation")
-
-    if not repaired_components:
+    if len(loaded.faces) == 0:
+        print("  no faces remain after duplicate removal")
         return None
 
-    repaired = trimesh.util.concatenate(repaired_components)
+    export_stage(loaded, "02_after_deduplication")
 
+    # ---------------------------------------------------------
+    # Stage 3: Remove degenerate faces.
+    # ---------------------------------------------------------
     try:
-        repaired.process(validate=True)
+        loaded.update_faces(loaded.nondegenerate_faces())
+        loaded.remove_unreferenced_vertices()
     except Exception as exc:
-        print(f"  mesh processing failed: {exc}")
+        print(f"  degenerate-face cleanup failed: {exc}")
         return None
+
+    if len(loaded.vertices) == 0 or len(loaded.faces) == 0:
+        print("  mesh is empty after degenerate-face cleanup")
+        return None
+
+    if not np.isfinite(loaded.vertices).all():
+        print("  mesh contains non-finite vertices")
+        return None
+
+    export_stage(loaded, "03_after_cleanup")
+
+    # ---------------------------------------------------------
+    # Stage 4: Decimate the cleaned mesh.
+    #
+    # Do not split and independently repair every component.
+    # Small disconnected parts may be legitimate airplane details.
+    # ---------------------------------------------------------
+    cleaned_faces = len(loaded.faces)
+    decimated = decimate_mesh(loaded, MAX_FACES)
 
     if (
-        len(repaired.vertices) == 0
-        or len(repaired.faces) == 0
-        or not np.isfinite(repaired.vertices).all()
+        decimated is None
+        or len(decimated.vertices) == 0
+        or len(decimated.faces) == 0
     ):
-        print("  repaired mesh contains invalid geometry")
+        print("  mesh decimation produced an empty mesh")
         return None
 
-    export_stage(repaired, "03_after_meshfix")
-
-    if not repaired.is_watertight:
-        print("  combined component repair is not watertight")
+    if not np.isfinite(decimated.vertices).all():
+        print("  decimated mesh contains non-finite vertices")
         return None
 
-    # Check whether repair substantially changed the bounding-box dimensions.
-    repaired_extents = np.asarray(
-        repaired.bounding_box.extents, dtype=np.float64
+    decimated.remove_unreferenced_vertices()
+
+    print(
+        f"  decimation: {cleaned_faces} -> "
+        f"{len(decimated.faces)} faces"
     )
 
-    valid_axes = original_extents > 1e-8
-    ratios = repaired_extents[valid_axes] / original_extents[valid_axes]
+    export_stage(decimated, "04_after_decimation")
 
-    if len(ratios) and (
-        np.any(ratios < 0.5) or np.any(ratios > 2.0)
-    ):
-        print(
-            "  WARNING: repaired bounding-box extent changed substantially; "
-            f"original={np.round(original_extents, 4)}, "
-            f"repaired={np.round(repaired_extents, 4)}, "
-            f"ratios={np.round(ratios, 3)}"
-        )
+    # ---------------------------------------------------------
+    # Stage 5: Center and normalize to maximum extent = 1.
+    # ---------------------------------------------------------
+    bounds = np.asarray(decimated.bounds, dtype=np.float64)
 
-    # Stage 5: center and normalize the mesh.
-    repaired.vertices -= repaired.bounding_box.centroid
+    if bounds.shape != (2, 3) or not np.isfinite(bounds).all():
+        print("  invalid mesh bounds")
+        return None
 
-    max_extent = float(np.max(repaired.bounding_box.extents))
+    center = bounds.mean(axis=0)
+    extents = bounds[1] - bounds[0]
+    max_extent = float(np.max(extents))
 
     if not np.isfinite(max_extent) or max_extent <= 1e-8:
         print("  invalid bounding-box extent")
         return None
 
-    repaired.vertices *= 1.0 / max_extent
+    decimated.vertices = (
+        np.asarray(decimated.vertices, dtype=np.float64) - center
+    ) / max_extent
 
-    export_stage(repaired, "04_normalized")
+    # Verify the final mesh.
+    if (
+        len(decimated.vertices) == 0
+        or len(decimated.faces) == 0
+        or not np.isfinite(decimated.vertices).all()
+    ):
+        print("  normalized mesh is invalid")
+        return None
+
+    export_stage(decimated, "05_normalized")
+
+    components = decimated.split(only_watertight=False)
 
     print(
-        f"  repair kept {len(repaired_components)}/{len(components)} "
-        f"components; "
-        f"normalized extents="
-        f"{np.round(repaired.bounding_box.extents, 3)}"
+        f"  mesh accepted: vertices={len(decimated.vertices)}, "
+        f"faces={len(decimated.faces)}, "
+        f"components={len(components)}, "
+        f"watertight={decimated.is_watertight}, "
+        f"normalized_extents="
+        f"{np.round(decimated.bounding_box.extents, 4)}"
     )
 
-    return repaired
+    return decimated
+
+
+def sample_surface_points(mesh, n_points=1024):
+    """
+    Sample a fixed number of points from the mesh surface.
+
+    Returns:
+        np.ndarray: Float32 array of shape (n_points, 3),
+                    normalized to the mesh coordinate system.
+    """
+    if (
+        mesh is None
+        or len(mesh.vertices) == 0
+        or len(mesh.faces) == 0
+    ):
+        return None
+
+    try:
+        points, _ = trimesh.sample.sample_surface(
+            mesh,
+            count=n_points,
+        )
+    except Exception as exc:
+        print(f"  surface sampling failed: {exc}")
+        return None
+
+    points = np.asarray(points, dtype=np.float32)
+
+    if points.shape != (n_points, 3):
+        return None
+
+    if not np.isfinite(points).all():
+        return None
+
+    return points
+
 
 def extract_skeleton_points(mesh, n_points=N_SKELETON_POINTS):
     fixed = sk.pre.fix_mesh(mesh, remove_disconnected=5, inplace=False)
