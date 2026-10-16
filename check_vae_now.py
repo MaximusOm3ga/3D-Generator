@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 
 from dataset import SkeletalMeshDataset
 from vae_model import SkeletalVAE
-from train_vae import check_reconstruction  # reuse the exact same logic
+from train_vae import check_reconstruction, evaluate_dense_grid_occupancy  # reuse the exact same logic
 
 
 def parse_args():
@@ -23,6 +23,7 @@ def parse_args():
     p.add_argument("--vae-ckpt", type=str, default="checkpoints/vae_best.pt")
     p.add_argument("--cache-dir", type=str, default="cached_objects")
     p.add_argument("--resolution", type=int, default=48)
+    p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--debug-object-index", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -75,6 +76,43 @@ def main():
     loader = DataLoader([sample], batch_size=1, shuffle=False, num_workers=0)
 
     check_reconstruction(model, loader, device, epoch=f"checkpoint_{epoch}", resolution=args.resolution)
+
+    obj_path = str(ds.paths[debug_idx])
+    obj_data = np.load(obj_path)
+    eval_sample = {
+        "surface_xyz": sample["surface_xyz"].numpy(),
+        "skeleton_points": sample["skeleton_points"].numpy(),
+        "mesh_vertices": obj_data["mesh_vertices"],
+        "mesh_faces": obj_data["mesh_faces"],
+    }
+    mean_metrics = evaluate_dense_grid_occupancy(
+        model,
+        eval_sample,
+        device,
+        resolution=args.resolution,
+        threshold=args.threshold,
+        decode_mode="mean",
+        sampler_seed=args.seed,
+    )
+    sampled_metrics = evaluate_dense_grid_occupancy(
+        model,
+        eval_sample,
+        device,
+        resolution=args.resolution,
+        threshold=args.threshold,
+        decode_mode="stochastic",
+        sampler_seed=args.seed,
+    )
+    print(
+        f"debug object={obj_path} | mean dense_iou={mean_metrics['dense_iou']:.6f} "
+        f"precision={mean_metrics['precision']:.6f} recall={mean_metrics['recall']:.6f} "
+        f"occ_frac={mean_metrics['occupied_fraction']:.6f} mesh_components={mean_metrics['mesh_components']}"
+    )
+    print(
+        f"debug object={obj_path} | sample dense_iou={sampled_metrics['dense_iou']:.6f} "
+        f"precision={sampled_metrics['precision']:.6f} recall={sampled_metrics['recall']:.6f} "
+        f"occ_frac={sampled_metrics['occupied_fraction']:.6f} mesh_components={sampled_metrics['mesh_components']}"
+    )
 
 
 if __name__ == "__main__":

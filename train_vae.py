@@ -528,7 +528,7 @@ def check_reconstruction(model, val_loader, device, epoch, resolution=48, run_id
 
 
 @torch.no_grad()
-def evaluate_dense_grid_occupancy(model, sample, device, resolution=48, threshold=0.5, decode_mode=None):
+def evaluate_dense_grid_occupancy(model, sample, device, resolution=48, threshold=0.5, decode_mode=None, sampler_seed=None):
     if "mesh_vertices" not in sample or "mesh_faces" not in sample:
         raise ValueError("Dense-grid occupancy evaluation requires mesh_vertices and mesh_faces in the sample metadata.")
     was_training = model.training
@@ -557,10 +557,12 @@ def evaluate_dense_grid_occupancy(model, sample, device, resolution=48, threshol
         if decode_mode is None:
             decode_mode = getattr(model, "decode_mode", "mean")
         if decode_mode == "stochastic":
-            # Dense-grid diagnostics must be deterministic for valid checkpoint comparisons.
-            # Use posterior mean unless the caller explicitly requests a stochastic decode.
-            decode_mode = "mean"
-        latent = mean if decode_mode == "mean" else model.reparameterize(mean, logvar)
+            with torch.random.fork_rng(devices=[]):
+                if sampler_seed is not None:
+                    torch.manual_seed(int(sampler_seed))
+                latent = model.reparameterize(mean, logvar)
+        else:
+            latent = mean
         logits = model.decoder(query, latent)
         probs = torch.sigmoid(logits).reshape(-1).cpu().numpy()
         if not np.isfinite(probs).all():
