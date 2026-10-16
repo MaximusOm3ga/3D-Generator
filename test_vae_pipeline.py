@@ -8,7 +8,7 @@ from skimage import measure
 
 from encode_latents import validate_latent_batch
 from latent_dataset import load_latent_stats, normalize_latent, denormalize_latent
-from sample_dit import decode_to_mesh
+from sample_dit import decode_to_mesh, make_schedule, sample_latent
 from train_vae import (
     evaluate_dense_grid_occupancy,
     collect_grad_stats,
@@ -109,6 +109,35 @@ def test_debug_validation_samples_are_reproducible():
     sample_b = {"surface_xyz": surface_xyz.copy(), "skeleton_points": skeleton_points.copy()}
     assert np.allclose(sample_a["surface_xyz"], sample_b["surface_xyz"])
     assert np.allclose(sample_a["skeleton_points"], sample_b["skeleton_points"])
+
+
+def test_reverse_diffusion_timestep_order_is_high_to_low_and_finite():
+    class DummyDiT(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def forward(self, z_noisy, timesteps, clip_tokens=None, dino_tokens=None):
+            self.calls.append(timesteps.detach().clone())
+            return torch.randn_like(z_noisy)
+
+    dit = DummyDiT()
+    betas, alphas, alphas_cumprod = make_schedule(12, device="cpu")
+    sampled = sample_latent(
+        dit,
+        shape=(1, 4, 3),
+        alphas=alphas,
+        alphas_cumprod=alphas_cumprod,
+        timesteps=12,
+        sampling_steps=5,
+        device="cpu",
+        sampler="ddim",
+        ddim_eta=0.0,
+    )
+    seen = torch.cat([t for t in dit.calls], dim=0).tolist()
+    assert seen[0] >= seen[-1]
+    assert seen[-1] == 0
+    assert torch.isfinite(sampled).all()
 
 
 def test_dense_grid_eval_and_mesh_scaling_in_range():

@@ -77,8 +77,7 @@ def load_condition(condition_path, device):
 def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps, device,
                   clip_tokens=None, dino_tokens=None, cfg_scale=1.0, sampler="ddim", ddim_eta=0.0):
     z = torch.randn(shape, device=device)
-    step_indices = torch.linspace(timesteps - 1, 0, steps=sampling_steps, device=device).long().unique()
-    step_indices = step_indices.flip(0)
+    step_indices = torch.linspace(timesteps - 1, 0, steps=sampling_steps, device=device).long()
 
     for i, t_idx in enumerate(step_indices):
         t = torch.full((shape[0],), int(t_idx.item()), device=device, dtype=torch.long)
@@ -91,7 +90,9 @@ def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps,
             eps = eps_cond
 
         ab_t = alphas_cumprod[t].view(-1, 1, 1)
-        z0_hat = (z - torch.sqrt(1.0 - ab_t) * eps) / torch.sqrt(ab_t.clamp_min(1e-8))
+        sqrt_ab_t = torch.sqrt(ab_t.clamp_min(1e-8))
+        sqrt_one_minus_ab_t = torch.sqrt(1.0 - ab_t.clamp_min(1e-8))
+        z0_hat = (z - sqrt_one_minus_ab_t * eps) / sqrt_ab_t
 
         if i + 1 < len(step_indices):
             t_prev_val = int(step_indices[i + 1].item())
@@ -101,17 +102,18 @@ def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps,
         ab_prev = alphas_cumprod[t_prev].view(-1, 1, 1)
 
         if sampler.lower() == "ddpm":
-            if int(t_idx.item()) > 0:
+            if t_prev_val > 0:
                 noise = torch.randn_like(z)
-                z = torch.sqrt(ab_prev) * z0_hat + torch.sqrt(1.0 - ab_prev) * noise
+                variance = 1.0 - ab_prev
+                z = torch.sqrt(ab_prev) * z0_hat + torch.sqrt(variance.clamp_min(1e-8)) * noise
             else:
                 z = z0_hat
             continue
 
         sigma_t = ddim_eta * torch.sqrt((1.0 - ab_prev) / (1.0 - ab_t.clamp_min(1e-8))) * torch.sqrt(1.0 - ab_t / ab_prev.clamp_min(1e-8))
-        if int(t_idx.item()) > 0:
+        if t_prev_val > 0:
             noise = torch.randn_like(z) if ddim_eta > 0 else torch.zeros_like(z)
-            z = torch.sqrt(ab_prev) * z0_hat + torch.sqrt(1.0 - ab_prev - sigma_t.pow(2)) * eps + sigma_t * noise
+            z = torch.sqrt(ab_prev) * z0_hat + torch.sqrt((1.0 - ab_prev - sigma_t.pow(2)).clamp_min(0.0)) * eps + sigma_t * noise
         else:
             z = z0_hat
     return z
