@@ -188,6 +188,7 @@ def make_dataloaders(args):
     if args.debug_one_object:
         idx = min(max(args.debug_object_index, 0), len(full_dataset) - 1)
         fixed_sample = _materialize_debug_sample(full_dataset, idx, args.seed)
+        fixed_sample["object_path"] = str(full_dataset.paths[idx])
         train_set = val_set = [fixed_sample]
         effective_batch_size = 1
         print(
@@ -736,8 +737,18 @@ def main():
             check_reconstruction(model, val_loader, device, epoch)
             if args.debug_one_object:
                 batch = next(iter(val_loader))
-                index = 0 if not isinstance(val_loader.dataset, Subset) else val_loader.dataset.indices[0]
-                obj_path = train_loader.dataset.dataset.paths[index] if isinstance(train_loader.dataset, Subset) else train_loader.dataset.paths[index]
+                object_path = batch.get("object_path")
+                if isinstance(object_path, (list, tuple)):
+                    object_path = object_path[0]
+                if object_path is None:
+                    index = 0 if not isinstance(val_loader.dataset, Subset) else val_loader.dataset.indices[0]
+                    obj_path = (
+                        train_loader.dataset.dataset.paths[index]
+                        if isinstance(train_loader.dataset, Subset)
+                        else getattr(train_loader.dataset, "paths", [None])[index]
+                    )
+                else:
+                    obj_path = object_path
                 obj_data = np.load(obj_path)
                 sample = {
                     "surface_xyz": batch["surface_xyz"][0].cpu().numpy(),

@@ -132,26 +132,86 @@ def repair_mesh(path):
         return None
 
     if isinstance(loaded, trimesh.Scene):
-        loaded = trimesh.util.concatenate(
-            [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        geometries = [
+            g for g in loaded.geometry.values()
+            if isinstance(g, trimesh.Trimesh) and len(g.faces) > 0
+        ]
+        if not geometries:
+            return None
+        loaded = trimesh.util.concatenate(geometries)
+
+    if loaded is None or len(loaded.vertices) == 0 or len(loaded.faces) == 0:
+        return None
+
+    original_extents = np.asarray(loaded.bounding_box.extents, dtype=np.float64)
+    components = loaded.split(only_watertight=False)
+    if not components:
+        components = [loaded]
+
+    repaired_components = []
+    for component_idx, component in enumerate(components):
+        if len(component.vertices) == 0 or len(component.faces) == 0:
+            continue
+        component = decimate_mesh(component)
+
+        candidate = None
+        try:
+            fixer = pymeshfix.MeshFix(component.vertices, component.faces)
+            fixer.repair()
+            candidate = trimesh.Trimesh(
+                vertices=np.asarray(fixer.points),
+                faces=np.asarray(fixer.faces),
+                process=True,
+            )
+        except Exception as exc:
+            print(f"  component {component_idx}: MeshFix failed: {exc}")
+
+        if (
+            candidate is not None
+            and len(candidate.vertices) > 0
+            and len(candidate.faces) > 0
+            and candidate.is_watertight
+        ):
+            repaired_components.append(candidate)
+        elif component.is_watertight:
+            # Keep an already-closed component if MeshFix damaged/failed it.
+            repaired_components.append(component)
+        else:
+            print(
+                f"  component {component_idx} could not be repaired; "
+                "rejecting object rather than dropping this part"
+            )
+            return None
+
+    if not repaired_components:
+        return None
+
+    repaired = trimesh.util.concatenate(repaired_components)
+    repaired.process(validate=True)
+    if not repaired.is_watertight or len(repaired.vertices) == 0:
+        print("  combined component repair is not watertight")
+        return None
+
+    repaired_extents = np.asarray(repaired.bounding_box.extents, dtype=np.float64)
+    valid_axes = original_extents > 1e-8
+    ratios = repaired_extents[valid_axes] / original_extents[valid_axes]
+    if len(ratios) and (np.any(ratios < 0.5) or np.any(ratios > 2.0)):
+        print(
+            "  WARNING: repaired bounding-box extent changed substantially; "
+            f"original={np.round(original_extents, 4)}, "
+            f"repaired={np.round(repaired_extents, 4)}"
         )
 
-    if loaded is None or len(loaded.vertices) == 0:
-        return None
-
-    loaded = decimate_mesh(loaded)
-
-    fixer = pymeshfix.MeshFix(loaded.vertices, loaded.faces)
-    fixer.repair()
-    repaired = trimesh.Trimesh(vertices=fixer.points, faces=fixer.faces, process=True)
-
-    if not repaired.is_watertight or len(repaired.vertices) == 0:
-        return None
-
     repaired.vertices -= repaired.bounding_box.centroid
-    scale = 1.0 / max(repaired.bounding_box.extents)
-    repaired.vertices *= scale
+    max_extent = float(max(repaired.bounding_box.extents))
+    if not np.isfinite(max_extent) or max_extent <= 1e-8:
+        return None
+    repaired.vertices *= 1.0 / max_extent
 
+    print(
+        f"  repair kept {len(repaired_components)}/{len(components)} components; "
+        f"normalized extents={np.round(repaired.bounding_box.extents, 3)}"
+    )
     return repaired
 
 
