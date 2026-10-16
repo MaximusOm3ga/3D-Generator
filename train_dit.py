@@ -60,13 +60,19 @@ def main():
         condition_dir=args.condition_dir,
         split=args.split,
     )
+    if args.split != "train":
+        raise ValueError("--split must be 'train'; validation is drawn only from the training manifest.")
     if len(ds) < 2:
-        raise RuntimeError("DiT training requires at least 2 latent samples for train/validation split.")
+        raise RuntimeError("DiT training requires at least 2 training latents.")
+    # Deterministic split: repeated runs use the same validation objects.
     train_size = max(1, int(0.9 * len(ds)))
-    val_size = max(1, len(ds) - train_size)
-    train_ds, val_ds = torch.utils.data.random_split(ds, [train_size, val_size])
-    if len(train_ds) == 0:
-        raise RuntimeError("Training split is empty; the latent directory is too small for DiT training.")
+    val_size = len(ds) - train_size
+    if val_size < 1:
+        train_size, val_size = len(ds) - 1, 1
+    split_generator = torch.Generator().manual_seed(42)
+    train_ds, val_ds = torch.utils.data.random_split(ds, [train_size, val_size], generator=split_generator)
+    if len(train_ds) == 0 or len(val_ds) == 0:
+        raise RuntimeError("Both DiT training and validation splits must be non-empty.")
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -176,8 +182,9 @@ def main():
                 zt = torch.sqrt(a_t) * z0 + torch.sqrt(1 - a_t) * eps
                 clip_tokens = batch.get("clip_tokens")
                 dino_tokens = batch.get("dino_tokens")
-                clip_tokens = maybe_dropout_condition(clip_tokens.to(DEVICE) if clip_tokens is not None else None)
-                dino_tokens = maybe_dropout_condition(dino_tokens.to(DEVICE) if dino_tokens is not None else None)
+                # Validation must be deterministic and measure the conditional path as trained.
+                clip_tokens = clip_tokens.to(DEVICE) if clip_tokens is not None else None
+                dino_tokens = dino_tokens.to(DEVICE) if dino_tokens is not None else None
                 pred_eps = model(zt, t, clip_tokens=clip_tokens, dino_tokens=dino_tokens)
                 val_total += torch.mean((pred_eps - eps) ** 2).item()
                 val_n += 1
@@ -196,6 +203,8 @@ def main():
                     "val_loss": float(best_val_loss),
                     "n_tokens": n_tokens,
                     "latent_dim": latent_dim,
+                    "args": vars(args),
+                    "best_val_loss": float(best_val_loss),
                     "rng_state": capture_rng_state(),
                 },
                 os.path.join(args.checkpoint_dir, "dit_best.pt"),
