@@ -79,8 +79,10 @@ def select_split_paths(paths, split):
         if matches.get(split_name, False):
             selected.append(path)
     if not selected:
-        print(f"No {split_name} cache objects were found by filename markers; falling back to the full cache for this run.")
-        return list(paths)
+        raise RuntimeError(
+            f"No objects matched split={split_name!r} in {paths[0].rsplit('/', 1)[0] if paths else '.'}. "
+            "Use a cache built with explicit split markers in the object names, or regenerate the cache with split metadata."
+        )
     return selected
 
 

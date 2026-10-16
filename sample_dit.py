@@ -113,11 +113,16 @@ def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps,
             if t_prev_val <= 0:
                 z = z0_hat
                 continue
-            beta_t = 1.0 - (ab_t / ab_prev.clamp_min(1e-8))
-            beta_tilde = beta_t * (1.0 - ab_prev) / (1.0 - ab_t).clamp_min(1e-8)
-            posterior_mean = torch.sqrt(ab_prev) * z0_hat + torch.sqrt((1.0 - ab_prev - beta_tilde).clamp_min(0.0)) * eps
+            alpha_bar_t = ab_t.clamp_min(1e-8)
+            alpha_bar_prev = ab_prev.clamp_min(1e-8)
+            beta_t = 1.0 - (alpha_bar_t / alpha_bar_prev)
+            posterior_variance = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t).clamp_min(1e-8)
+            posterior_mean = (
+                torch.sqrt(alpha_bar_prev) * z0_hat
+                + torch.sqrt((1.0 - alpha_bar_prev - posterior_variance).clamp_min(0.0)) * eps
+            )
             noise = torch.randn_like(z)
-            z = posterior_mean + torch.sqrt(beta_tilde.clamp_min(1e-8)) * noise
+            z = posterior_mean + torch.sqrt(posterior_variance.clamp_min(1e-8)) * noise
             continue
 
         if t_prev_val <= 0:

@@ -66,14 +66,23 @@ def validate_cache_metadata(path):
 
         if mesh_vertices.ndim != 2 or mesh_vertices.shape[1] != 3:
             raise ValueError(f"mesh_vertices has invalid shape in {path}: {mesh_vertices.shape}")
+        if mesh_vertices.shape[0] < 3:
+            raise ValueError(f"Mesh requires at least 3 vertices in {path}")
         if mesh_faces.ndim != 2 or mesh_faces.shape[1] != 3:
             raise ValueError(f"mesh_faces has invalid shape in {path}: {mesh_faces.shape}")
+        if mesh_faces.size and (mesh_faces.min() < 0 or mesh_faces.max() >= len(mesh_vertices)):
+            raise ValueError(f"Invalid face indices in {path}: face range [{mesh_faces.min()}, {mesh_faces.max()}] exceeds vertex count {len(mesh_vertices)}")
         if skeleton_points.ndim != 2 or skeleton_points.shape[1] != 3:
             raise ValueError(f"skeleton_points has invalid shape in {path}: {skeleton_points.shape}")
         if not np.isfinite(mesh_vertices).all() or not np.isfinite(skeleton_points).all():
             raise ValueError(f"Cache contains non-finite geometry in {path}")
-        if len(np.unique(np.round(skeleton_points, 6), axis=0)) < min(16, len(skeleton_points)):
-            raise ValueError(f"Skeleton anchors are too duplicated in {path}")
+        if skeleton_points.shape[0] != N_SKELETON_POINTS:
+            raise ValueError(f"Expected {N_SKELETON_POINTS} anchor points in {path}, got {skeleton_points.shape[0]}")
+        unique_count = len(np.unique(np.round(skeleton_points, 6), axis=0))
+        if unique_count < max(32, int(0.9 * skeleton_points.shape[0])):
+            raise ValueError(
+                f"Skeleton anchors are too duplicated in {path}: {unique_count}/{skeleton_points.shape[0]} unique"
+            )
 
 
 def mesh_quality_summary(mesh):
@@ -545,27 +554,33 @@ def extract_skeleton_points(mesh, n_points=N_SKELETON_POINTS):
 
 
 def farthest_point_sample(points, n_points):
+    points = np.asarray(points, dtype=np.float32)
     n_available = len(points)
     if n_available == 0:
         return None
+    if n_available < n_points:
+        raise ValueError(
+            f"Farthest-point sampling requires at least {n_points} points; got {n_available}. "
+            "Reject this mesh instead of silently duplicating anchors."
+        )
 
-    replace = n_available < n_points
     idx = np.random.choice(n_available, size=1)
-    selected = [idx[0]]
+    selected = [int(idx[0])]
     dist = np.linalg.norm(points - points[idx[0]], axis=1)
 
-    for _ in range(1, min(n_points, n_available)):
-        next_idx = np.argmax(dist)
+    for _ in range(1, n_points):
+        next_idx = int(np.argmax(dist))
         selected.append(next_idx)
         new_dist = np.linalg.norm(points - points[next_idx], axis=1)
         dist = np.minimum(dist, new_dist)
 
-    sampled = points[selected]
-    if replace and len(sampled) < n_points:
-        pad_idx = np.random.choice(len(sampled), size=n_points - len(sampled))
-        sampled = np.concatenate([sampled, sampled[pad_idx]], axis=0)
-
-    return sampled.astype(np.float32)
+    sampled = points[selected].astype(np.float32)
+    unique_count = len(np.unique(np.round(sampled, 6), axis=0))
+    if unique_count < max(32, int(0.9 * n_points)):
+        raise ValueError(
+            f"Farthest-point anchors are too duplicated: {unique_count}/{n_points} unique after sampling"
+        )
+    return sampled
 
 
 def run_modelnet(dataset_root, category=MODELNET_DEFAULT_CATEGORY, max_objects=None, split="train", output_dir=OUTPUT_DIR):
