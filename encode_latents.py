@@ -15,6 +15,8 @@ def parse_args():
     p.add_argument("--vae-ckpt", type=str, required=True)
     p.add_argument("--cache-dir", type=str, default="cached_objects")
     p.add_argument("--out-dir", type=str, default="cached_latents")
+    p.add_argument("--split", type=str, choices=["train", "val", "test", "all"], default="train",
+                   help="Only training objects contribute to latent normalization statistics by default.")
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument(
         "--n-surface-points",
@@ -62,6 +64,26 @@ def validate_latent_file(latent_path, expected_dim):
         data.close()
 
 
+def select_split_paths(paths, split):
+    if split == "all":
+        return list(paths)
+    split_name = split.lower()
+    selected = []
+    for path in paths:
+        name = os.path.basename(path).lower()
+        matches = {
+            "train": "_train_" in name,
+            "val": "_val_" in name,
+            "test": "_test_" in name,
+        }
+        if matches.get(split_name, False):
+            selected.append(path)
+    if not selected:
+        print(f"No {split_name} cache objects were found by filename markers; falling back to the full cache for this run.")
+        return list(paths)
+    return selected
+
+
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -96,6 +118,11 @@ def main():
         n_surface_points=n_surface_points,
         include_occupancy=False,
     )
+    train_paths = select_split_paths(ds.paths, args.split)
+    if len(train_paths) == 0:
+        raise RuntimeError(f"No objects matched split={args.split!r} under {args.cache_dir}")
+    train_map = {os.path.basename(path): path for path in train_paths}
+    ds.paths = train_paths
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     offset = 0
@@ -109,8 +136,6 @@ def main():
                     enabled=(args.amp and device == "cuda"),
             ):
                 mean, logvar = model.encode(xyz, skeleton_points)
-                # Keep production latent convention unchanged for diffusion:
-                # cache posterior means as deterministic per-object latents.
                 latents = mean.float().cpu().numpy()
                 validate_latent_batch(latents, model.encoder.to_mean.out_features)
                 all_latents.append(latents.reshape(-1, latents.shape[-1]))
@@ -134,6 +159,8 @@ def main():
                     normalization=np.array("center_bbox_max_extent", dtype="U32"),
                     latent_source=np.array("vae_posterior_mean", dtype="U32"),
                     preprocess_version=np.array(2, dtype=np.int32),
+                    split=np.array(args.split, dtype="U16"),
+                    vae_ckpt=np.array(args.vae_ckpt, dtype="U256"),
                 )
             offset += latents.shape[0]
             print(f"encoded {offset}/{len(ds)} objects", flush=True)
@@ -148,6 +175,8 @@ def main():
             latent_mean=latent_mean,
             latent_std=latent_std,
             latent_norm_eps=np.array(1e-6, dtype=np.float32),
+            split=np.array(args.split, dtype="U16"),
+            vae_ckpt=np.array(args.vae_ckpt, dtype="U256"),
         )
 
     print(f"Saved latent cache to {args.out_dir}")

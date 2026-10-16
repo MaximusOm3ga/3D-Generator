@@ -76,8 +76,16 @@ def load_condition(condition_path, device):
 @torch.no_grad()
 def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps, device,
                   clip_tokens=None, dino_tokens=None, cfg_scale=1.0, sampler="ddim", ddim_eta=0.0):
+    if timesteps <= 0:
+        raise ValueError(f"timesteps must be positive, got {timesteps}")
+    if sampling_steps <= 0:
+        raise ValueError(f"sampling_steps must be positive, got {sampling_steps}")
+    if sampling_steps > timesteps:
+        raise ValueError(f"sampling_steps ({sampling_steps}) cannot exceed timesteps ({timesteps})")
+
     z = torch.randn(shape, device=device)
     step_indices = torch.linspace(timesteps - 1, 0, steps=sampling_steps, device=device).long()
+    step_indices = torch.unique(step_indices, sorted=False).flip(0)
 
     for i, t_idx in enumerate(step_indices):
         t = torch.full((shape[0],), int(t_idx.item()), device=device, dtype=torch.long)
@@ -89,9 +97,9 @@ def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps,
         else:
             eps = eps_cond
 
-        ab_t = alphas_cumprod[t].view(-1, 1, 1)
-        sqrt_ab_t = torch.sqrt(ab_t.clamp_min(1e-8))
-        sqrt_one_minus_ab_t = torch.sqrt(1.0 - ab_t.clamp_min(1e-8))
+        ab_t = alphas_cumprod[t].view(-1, 1, 1).clamp_min(1e-8)
+        sqrt_ab_t = torch.sqrt(ab_t)
+        sqrt_one_minus_ab_t = torch.sqrt(1.0 - ab_t)
         z0_hat = (z - sqrt_one_minus_ab_t * eps) / sqrt_ab_t
 
         if i + 1 < len(step_indices):
@@ -99,23 +107,29 @@ def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps,
         else:
             t_prev_val = 0
         t_prev = torch.full((shape[0],), t_prev_val, device=device, dtype=torch.long)
-        ab_prev = alphas_cumprod[t_prev].view(-1, 1, 1)
+        ab_prev = alphas_cumprod[t_prev].view(-1, 1, 1).clamp_min(1e-8)
 
         if sampler.lower() == "ddpm":
-            if t_prev_val > 0:
-                noise = torch.randn_like(z)
-                variance = 1.0 - ab_prev
-                z = torch.sqrt(ab_prev) * z0_hat + torch.sqrt(variance.clamp_min(1e-8)) * noise
-            else:
+            if t_prev_val <= 0:
                 z = z0_hat
+                continue
+            beta_t = 1.0 - (ab_t / ab_prev.clamp_min(1e-8))
+            beta_tilde = beta_t * (1.0 - ab_prev) / (1.0 - ab_t).clamp_min(1e-8)
+            posterior_mean = torch.sqrt(ab_prev) * z0_hat + torch.sqrt((1.0 - ab_prev - beta_tilde).clamp_min(0.0)) * eps
+            noise = torch.randn_like(z)
+            z = posterior_mean + torch.sqrt(beta_tilde.clamp_min(1e-8)) * noise
             continue
 
-        sigma_t = ddim_eta * torch.sqrt((1.0 - ab_prev) / (1.0 - ab_t.clamp_min(1e-8))) * torch.sqrt(1.0 - ab_t / ab_prev.clamp_min(1e-8))
-        if t_prev_val > 0:
-            noise = torch.randn_like(z) if ddim_eta > 0 else torch.zeros_like(z)
-            z = torch.sqrt(ab_prev) * z0_hat + torch.sqrt((1.0 - ab_prev - sigma_t.pow(2)).clamp_min(0.0)) * eps + sigma_t * noise
-        else:
+        if t_prev_val <= 0:
             z = z0_hat
+            continue
+        sigma_t = ddim_eta * torch.sqrt((1.0 - ab_prev) / (1.0 - ab_t)) * torch.sqrt(1.0 - ab_t / ab_prev)
+        noise = torch.randn_like(z) if ddim_eta > 0 else torch.zeros_like(z)
+        z = (
+            torch.sqrt(ab_prev) * z0_hat
+            + torch.sqrt((1.0 - ab_prev - sigma_t.pow(2)).clamp_min(0.0)) * eps
+            + sigma_t * noise
+        )
     return z
 
 

@@ -145,6 +145,26 @@ def test_reverse_diffusion_timestep_order_is_high_to_low_and_finite():
     assert torch.isfinite(sampled).all()
 
 
+def test_ddpm_sampling_stays_finite_with_reduced_schedule():
+    class DummyDiT(torch.nn.Module):
+        def forward(self, z_noisy, timesteps, clip_tokens=None, dino_tokens=None):
+            return torch.randn_like(z_noisy)
+
+    betas, alphas, alphas_cumprod = make_schedule(20, device="cpu")
+    sampled = sample_latent(
+        DummyDiT(),
+        shape=(2, 4, 3),
+        alphas=alphas,
+        alphas_cumprod=alphas_cumprod,
+        timesteps=20,
+        sampling_steps=8,
+        device="cpu",
+        sampler="ddpm",
+    )
+    assert torch.isfinite(sampled).all()
+    assert sampled.shape == (2, 4, 3)
+
+
 def test_dense_grid_eval_and_mesh_scaling_in_range():
     torch.manual_seed(2)
     np.random.seed(2)
