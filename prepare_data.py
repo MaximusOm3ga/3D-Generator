@@ -245,14 +245,28 @@ def repair_mesh(path, diagnostic_dir=None):
             # Preserve an already-watertight component if repair fails.
             repaired_components.append(component)
 
+
         else:
+
             print(
+
                 f"  component {component_idx} could not be repaired; "
-                "rejecting object rather than silently dropping the part"
+
+                "exporting diagnostic geometry before rejecting object"
+
             )
+
+            if diagnostic_dir:
+                export_stage(
+
+                    component,
+
+                    f"02_component_{component_idx}_before_meshfix",
+
+                )
+
             return None
 
-    # Export all decimated components before MeshFix results are combined.
     if decimated_components:
         decimated_mesh = trimesh.util.concatenate(decimated_components)
         export_stage(decimated_mesh, "02_after_decimation")
@@ -260,7 +274,6 @@ def repair_mesh(path, diagnostic_dir=None):
     if not repaired_components:
         return None
 
-    # Stage 4: concatenate repaired components.
     repaired = trimesh.util.concatenate(repaired_components)
 
     try:
