@@ -167,19 +167,24 @@ def main():
             offset += latents.shape[0]
             print(f"encoded {offset}/{len(ds)} objects", flush=True)
 
-    if all_latents:
+    if all_latents and args.split == "train":
+        # Normalization is fitted on training latents only. Encoding val/test must
+        # never overwrite these statistics, otherwise evaluation leaks information.
         stacked = np.concatenate(all_latents, axis=0).astype(np.float32)
         latent_mean = stacked.mean(axis=0, dtype=np.float64).astype(np.float32)
         latent_std = stacked.std(axis=0, dtype=np.float64).astype(np.float32)
-        latent_std = np.where(latent_std <= 0.0, 1.0, latent_std)
+        latent_std = np.maximum(latent_std, 1e-6)
         np.savez(
             os.path.join(args.out_dir, "latent_stats.npz"),
             latent_mean=latent_mean,
             latent_std=latent_std,
             latent_norm_eps=np.array(1e-6, dtype=np.float32),
-            split=np.array(args.split, dtype="U16"),
+            split=np.array("train", dtype="U16"),
             vae_ckpt=np.array(args.vae_ckpt, dtype="U256"),
+            latent_cache_version=np.array(LATENT_CACHE_VERSION, dtype=np.int32),
         )
+    elif all_latents and args.split in {"val", "test"}:
+        print("Keeping existing training-only latent_stats.npz unchanged.", flush=True)
 
     print(f"Saved latent cache to {args.out_dir}")
 
