@@ -123,8 +123,29 @@ def load_filtered_uids(min_score=1.2, max_objects=2000, category=None):
 def download_meshes(uids, download_dir="~/.objaverse"):
     return objaverse.load_objects(uids=uids, download_processes=4)
 
+def export_diagnostic_mesh(mesh, stage, output_dir):
+    """Export an intermediate mesh for inspection in Blender."""
+    if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+        print(f"[DIAGNOSTIC] {stage}: empty mesh")
+        return
 
-def repair_mesh(path):
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"{stage}.ply")
+
+    try:
+        mesh.export(path, file_type="ply")
+        print(
+            f"[DIAGNOSTIC] {stage}: "
+            f"vertices={len(mesh.vertices)}, "
+            f"faces={len(mesh.faces)}, "
+            f"extents={np.round(mesh.bounding_box.extents, 4)}, "
+            f"watertight={mesh.is_watertight}, "
+            f"path={path}"
+        )
+    except Exception as exc:
+        print(f"[DIAGNOSTIC] Failed to export {stage}: {exc}")
+
+def repair_mesh(path, diagnostic_dir=None):
     try:
         loaded = trimesh.load(path, force="mesh", process=True)
     except Exception as e:
@@ -143,28 +164,74 @@ def repair_mesh(path):
     if loaded is None or len(loaded.vertices) == 0 or len(loaded.faces) == 0:
         return None
 
-    original_extents = np.asarray(loaded.bounding_box.extents, dtype=np.float64)
+    def export_stage(mesh, stage):
+        if diagnostic_dir is None or mesh is None:
+            return
+
+        if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            print(f"  [DIAGNOSTIC] {stage}: empty mesh")
+            return
+
+        os.makedirs(diagnostic_dir, exist_ok=True)
+        output_path = os.path.join(diagnostic_dir, f"{stage}.ply")
+
+        try:
+            mesh.export(output_path, file_type="ply")
+            print(
+                f"  [DIAGNOSTIC] {stage}: "
+                f"vertices={len(mesh.vertices)}, "
+                f"faces={len(mesh.faces)}, "
+                f"extents={np.round(mesh.bounding_box.extents, 4)}, "
+                f"watertight={mesh.is_watertight}, "
+                f"saved={output_path}"
+            )
+        except Exception as exc:
+            print(f"  [DIAGNOSTIC] Export failed for {stage}: {exc}")
+
+    # Stage 1: mesh as loaded by Trimesh.
+    export_stage(loaded, "01_raw_loaded")
+
+    original_extents = np.asarray(
+        loaded.bounding_box.extents, dtype=np.float64
+    )
+
+    # Split disconnected components so repair can be performed separately.
     components = loaded.split(only_watertight=False)
     if not components:
         components = [loaded]
 
+    decimated_components = []
     repaired_components = []
+
     for component_idx, component in enumerate(components):
         if len(component.vertices) == 0 or len(component.faces) == 0:
             continue
+
+        # Stage 2: decimation.
         component = decimate_mesh(component)
+        decimated_components.append(component.copy())
 
         candidate = None
+
+        # Stage 3: repair the decimated component.
         try:
-            fixer = pymeshfix.MeshFix(component.vertices, component.faces)
+            fixer = pymeshfix.MeshFix(
+                component.vertices,
+                component.faces,
+            )
             fixer.repair()
+
             candidate = trimesh.Trimesh(
                 vertices=np.asarray(fixer.points),
                 faces=np.asarray(fixer.faces),
                 process=True,
             )
+
         except Exception as exc:
-            print(f"  component {component_idx}: MeshFix failed: {exc}")
+            print(
+                f"  component {component_idx}: "
+                f"MeshFix failed: {exc}"
+            )
 
         if (
             candidate is not None
@@ -173,47 +240,88 @@ def repair_mesh(path):
             and candidate.is_watertight
         ):
             repaired_components.append(candidate)
+
         elif component.is_watertight:
-            # Keep an already-closed component if MeshFix damaged/failed it.
+            # Preserve an already-watertight component if repair fails.
             repaired_components.append(component)
+
         else:
             print(
                 f"  component {component_idx} could not be repaired; "
-                "rejecting object rather than dropping this part"
+                "rejecting object rather than silently dropping the part"
             )
             return None
+
+    # Export all decimated components before MeshFix results are combined.
+    if decimated_components:
+        decimated_mesh = trimesh.util.concatenate(decimated_components)
+        export_stage(decimated_mesh, "02_after_decimation")
 
     if not repaired_components:
         return None
 
+    # Stage 4: concatenate repaired components.
     repaired = trimesh.util.concatenate(repaired_components)
-    repaired.process(validate=True)
-    if not repaired.is_watertight or len(repaired.vertices) == 0:
+
+    try:
+        repaired.process(validate=True)
+    except Exception as exc:
+        print(f"  mesh processing failed: {exc}")
+        return None
+
+    if (
+        len(repaired.vertices) == 0
+        or len(repaired.faces) == 0
+        or not np.isfinite(repaired.vertices).all()
+    ):
+        print("  repaired mesh contains invalid geometry")
+        return None
+
+    export_stage(repaired, "03_after_meshfix")
+
+    if not repaired.is_watertight:
         print("  combined component repair is not watertight")
         return None
 
-    repaired_extents = np.asarray(repaired.bounding_box.extents, dtype=np.float64)
+    # Check whether repair substantially changed the bounding-box dimensions.
+    repaired_extents = np.asarray(
+        repaired.bounding_box.extents, dtype=np.float64
+    )
+
     valid_axes = original_extents > 1e-8
     ratios = repaired_extents[valid_axes] / original_extents[valid_axes]
-    if len(ratios) and (np.any(ratios < 0.5) or np.any(ratios > 2.0)):
+
+    if len(ratios) and (
+        np.any(ratios < 0.5) or np.any(ratios > 2.0)
+    ):
         print(
             "  WARNING: repaired bounding-box extent changed substantially; "
             f"original={np.round(original_extents, 4)}, "
-            f"repaired={np.round(repaired_extents, 4)}"
+            f"repaired={np.round(repaired_extents, 4)}, "
+            f"ratios={np.round(ratios, 3)}"
         )
 
+    # Stage 5: center and normalize the mesh.
     repaired.vertices -= repaired.bounding_box.centroid
-    max_extent = float(max(repaired.bounding_box.extents))
+
+    max_extent = float(np.max(repaired.bounding_box.extents))
+
     if not np.isfinite(max_extent) or max_extent <= 1e-8:
+        print("  invalid bounding-box extent")
         return None
+
     repaired.vertices *= 1.0 / max_extent
 
-    print(
-        f"  repair kept {len(repaired_components)}/{len(components)} components; "
-        f"normalized extents={np.round(repaired.bounding_box.extents, 3)}"
-    )
-    return repaired
+    export_stage(repaired, "04_normalized")
 
+    print(
+        f"  repair kept {len(repaired_components)}/{len(components)} "
+        f"components; "
+        f"normalized extents="
+        f"{np.round(repaired.bounding_box.extents, 3)}"
+    )
+
+    return repaired
 
 def extract_skeleton_points(mesh, n_points=N_SKELETON_POINTS):
     fixed = sk.pre.fix_mesh(mesh, remove_disconnected=5, inplace=False)
@@ -277,7 +385,18 @@ def run_modelnet(dataset_root, category=MODELNET_DEFAULT_CATEGORY, max_objects=N
             continue
 
         try:
-            mesh = repair_mesh(file_path)
+            diagnostic_dir = None
+
+            if rel_name == "airplane_0001.off":
+                diagnostic_dir = os.path.join(
+                    "mesh_diagnostics",
+                    "airplane_0001",
+                )
+
+            mesh = repair_mesh(
+                file_path,
+                diagnostic_dir=diagnostic_dir,
+            )
             if mesh is None:
                 skipped += 1
                 skip_reasons["repair_failed"] += 1
