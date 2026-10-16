@@ -380,15 +380,25 @@ def collect_grad_stats(model):
     }
 
 
+def compute_occupancy_pos_weight(labels):
+    labels = labels.float()
+    n_pos = labels.sum().clamp_min(1.0)
+    n_neg = (labels.numel() - labels.sum()).clamp_min(1.0)
+    return (n_neg / n_pos).detach()
+
+
 def compute_validation_metrics(model, val_loader, device, max_batches=3):
     model.eval()
     with torch.no_grad():
         metrics = {
             "bce": [],
+            "weighted_bce": [],
             "iou": [],
             "occupancy_ratio": [],
             "pred_occupancy_ratio": [],
             "latent_std": [],
+            "uniform_occupied_ratio": [],
+            "near_occupied_ratio": [],
         }
         seen = 0
         for batch in val_loader:
@@ -402,17 +412,35 @@ def compute_validation_metrics(model, val_loader, device, max_batches=3):
 
             logits, mean, logvar = model(surface_xyz, skeleton_points, query_points)
             probs = torch.sigmoid(logits)
-            bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels).item()
+            pos_weight = compute_occupancy_pos_weight(labels)
+            bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels, reduction="mean").item()
+            weighted_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                logits,
+                labels,
+                pos_weight=pos_weight,
+                reduction="mean",
+            ).item()
             pred = (probs > 0.5).float()
             inter = (pred * labels).sum().item()
             union = (pred + labels > 0).float().sum().item()
             iou = inter / max(union, 1e-8)
 
             metrics["bce"].append(bce)
+            metrics["weighted_bce"].append(weighted_bce)
             metrics["iou"].append(iou)
             metrics["occupancy_ratio"].append(float(labels.mean().item()))
             metrics["latent_std"].append(float(mean.std().item()))
             metrics["pred_occupancy_ratio"].append(float(pred.mean().item()))
+
+            source_mask = batch.get("query_source_mask")
+            if source_mask is not None:
+                src_mask = source_mask.to(device)
+                uniform_mask = src_mask == 0
+                near_mask = src_mask == 1
+                if uniform_mask.any():
+                    metrics["uniform_occupied_ratio"].append(float(labels[uniform_mask].mean().item()))
+                if near_mask.any():
+                    metrics["near_occupied_ratio"].append(float(labels[near_mask].mean().item()))
 
     return {k: float(np.mean(v)) if v else 0.0 for k, v in metrics.items()}
 
@@ -500,31 +528,105 @@ def check_reconstruction(model, val_loader, device, epoch, resolution=48, run_id
 
 
 @torch.no_grad()
-def evaluate_dense_grid_occupancy(model, sample, device, resolution=48, threshold=0.5):
+def evaluate_dense_grid_occupancy(model, sample, device, resolution=48, threshold=0.5, decode_mode=None):
     if "mesh_vertices" not in sample or "mesh_faces" not in sample:
         raise ValueError("Dense-grid occupancy evaluation requires mesh_vertices and mesh_faces in the sample metadata.")
-    mesh = trimesh.Trimesh(
-        vertices=np.asarray(sample["mesh_vertices"], dtype=np.float32),
-        faces=np.asarray(sample["mesh_faces"], dtype=np.int64),
-        process=False,
-    )
-    grid_coords = np.linspace(-1.0, 1.0, num=resolution, dtype=np.float32)
-    gx, gy, gz = np.meshgrid(grid_coords, grid_coords, grid_coords, indexing="ij")
-    grid_np = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3).astype(np.float32)
+    was_training = model.training
+    model.eval()
+    try:
+        mesh = trimesh.Trimesh(
+            vertices=np.asarray(sample["mesh_vertices"], dtype=np.float32),
+            faces=np.asarray(sample["mesh_faces"], dtype=np.int64),
+            process=False,
+        )
+        grid_coords = np.linspace(-1.0, 1.0, num=resolution, dtype=np.float32)
+        gx, gy, gz = np.meshgrid(grid_coords, grid_coords, grid_coords, indexing="ij")
+        grid_np = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3).astype(np.float32)
 
-    if mesh.is_empty:
-        raise ValueError("Ground-truth mesh is empty; dense-grid occupancy is invalid.")
-    gt_occ = mesh.contains(grid_np)
-    if gt_occ.size == 0 or not np.isfinite(gt_occ).all():
-        raise ValueError("Ground-truth occupancy on the normalized grid is invalid or empty.")
+        if mesh.is_empty:
+            raise ValueError("Ground-truth mesh is empty; dense-grid occupancy is invalid.")
+        gt_occ = mesh.contains(grid_np)
+        if gt_occ.size == 0 or not np.isfinite(gt_occ).all():
+            raise ValueError("Ground-truth occupancy on the normalized grid is invalid or empty.")
 
-    surface_xyz = torch.from_numpy(np.asarray(sample["surface_xyz"], dtype=np.float32)[None]).to(device)
-    skeleton_points = torch.from_numpy(np.asarray(sample["skeleton_points"], dtype=np.float32)[None]).to(device)
-    query = torch.from_numpy(grid_np[None]).to(device)
+        surface_xyz = torch.from_numpy(np.asarray(sample["surface_xyz"], dtype=np.float32)[None]).to(device)
+        skeleton_points = torch.from_numpy(np.asarray(sample["skeleton_points"], dtype=np.float32)[None]).to(device)
+        query = torch.from_numpy(grid_np[None]).to(device)
 
-    mean, logvar = model.encode(surface_xyz, skeleton_points)
-    latent = mean if model.decode_mode == "mean" else model.reparameterize(mean, logvar)
-    logits = model.decoder(query, latent)
+        mean, logvar = model.encode(surface_xyz, skeleton_points)
+        if decode_mode is None:
+            decode_mode = getattr(model, "decode_mode", "mean")
+        if decode_mode == "stochastic":
+            # Dense-grid diagnostics must be deterministic for valid checkpoint comparisons.
+            # Use posterior mean unless the caller explicitly requests a stochastic decode.
+            decode_mode = "mean"
+        latent = mean if decode_mode == "mean" else model.reparameterize(mean, logvar)
+        logits = model.decoder(query, latent)
+        probs = torch.sigmoid(logits).reshape(-1).cpu().numpy()
+        if not np.isfinite(probs).all():
+            raise ValueError("Predicted occupancy probabilities contain NaN/Inf on the dense grid.")
+
+        pred_occ = probs >= threshold
+        if pred_occ.size == 0:
+            raise ValueError("Predicted occupancy mask is empty.")
+        if gt_occ.size == 0 or not np.isfinite(gt_occ).all():
+            raise ValueError("Ground-truth occupancy mask is empty or invalid.")
+        if gt_occ.sum() == 0:
+            raise ValueError("Ground-truth occupancy mask has zero occupied voxels on the dense grid; dense IoU is undefined.")
+
+        if not (probs.min() < threshold < probs.max()):
+            raise RuntimeError(
+                f"Dense-grid field does not cross threshold={threshold:.3f}; min={probs.min():.6f}, max={probs.max():.6f}. "
+                "No automatic fallback is allowed in diagnostic evaluation."
+            )
+
+        inter = float(np.logical_and(pred_occ, gt_occ).sum())
+        union = float(np.logical_or(pred_occ, gt_occ).sum())
+        pred_pos = float(pred_occ.sum())
+        gt_pos = float(gt_occ.sum())
+        dense_iou = inter / max(union, 1.0)
+        precision = inter / max(pred_pos, 1.0) if pred_pos > 0 else 0.0
+        recall = inter / max(gt_pos, 1.0)
+        occupied_fraction = float(pred_occ.mean())
+        gt_occupied_fraction = float(gt_occ.mean())
+        probs_stats = {
+            "mean": float(probs.mean()),
+            "std": float(probs.std()),
+            "min": float(probs.min()),
+            "max": float(probs.max()),
+        }
+
+        occ_grid = probs.reshape(resolution, resolution, resolution)
+        voxel_binary = occ_grid >= threshold
+        if voxel_binary.any():
+            _, voxel_regions = ndimage.label(voxel_binary)
+            voxel_regions = int(voxel_regions)
+        else:
+            voxel_regions = 0
+
+        mesh_components = 0
+        if occupancy_threshold_is_crossed(occ_grid, threshold):
+            verts_voxel, faces, _, _ = measure.marching_cubes(occ_grid, level=threshold)
+            scale = 2.0 / (resolution - 1)
+            verts_world = verts_voxel * scale - 1.0
+            mesh_pred = trimesh.Trimesh(vertices=verts_world, faces=faces, process=False)
+            mesh_components = int(len(mesh_pred.split(only_watertight=False)))
+
+        return {
+            "dense_iou": dense_iou,
+            "precision": precision,
+            "recall": recall,
+            "intersection": inter,
+            "union": union,
+            "occupied_fraction": occupied_fraction,
+            "ground_truth_occupied_fraction": gt_occupied_fraction,
+            "predicted_occupied_fraction": occupied_fraction,
+            "prob_stats": probs_stats,
+            "voxel_connected_regions": voxel_regions,
+            "mesh_components": mesh_components,
+        }
+    finally:
+        model.train(was_training)
     probs = torch.sigmoid(logits).reshape(-1).cpu().numpy()
     if not np.isfinite(probs).all():
         raise ValueError("Predicted occupancy probabilities contain NaN/Inf on the dense grid.")
@@ -596,6 +698,14 @@ def occupancy_threshold_is_crossed(occ_grid, threshold):
 
 def main():
     args = parse_args()
+    if args.debug_one_object:
+        print(
+            "DEBUG ONE-OBJECT MODE: forcing deterministic mean decoding and zero KL pressure "
+            "to isolate whether the VAE can memorize a single mesh before introducing stochasticity."
+        )
+        args.decode_mode = "mean"
+        args.kl_weight = 0.0
+        args.kl_warmup_epochs = 0
     ensure_target_mode_supported(args)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -617,6 +727,7 @@ def main():
 
     start_epoch = 1
     best_val_loss = float("inf")
+    best_val_iou = float("-inf")
     if args.resume and os.path.exists(args.resume):
         print(f"Resuming from {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
@@ -627,6 +738,7 @@ def main():
             start_epoch += 1
         resume_step = checkpoint.get("batch_step", 0)
         best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+        best_val_iou = checkpoint.get("best_val_iou", float("-inf"))
     else:
         checkpoint = None
         resume_step = 0
@@ -649,6 +761,7 @@ def main():
                 "epoch": epoch,
                 "batch_step": batch_step,
                 "best_val_loss": best_loss,
+                "best_val_iou": best_val_iou,
                 "target_mode": model_cfg["target_mode"],
                 "architecture": model_cfg["architecture"],
                 "model_config": model_cfg,
@@ -659,7 +772,7 @@ def main():
         )
 
     for epoch in range(start_epoch, args.epochs + 1):
-        current_kl_weight = args.kl_weight * min(1.0, epoch / max(args.kl_warmup_epochs, 1))
+        current_kl_weight = 0.0 if args.debug_one_object else args.kl_weight * min(1.0, epoch / max(args.kl_warmup_epochs, 1))
         print(
             f"starting epoch {epoch}/{args.epochs} (kl_weight={current_kl_weight:.6f}, use_pos_weight={args.use_pos_weight}, target_mode={args.target_mode}, decode_mode={args.decode_mode})",
             flush=True,
@@ -679,7 +792,7 @@ def main():
                 else None
             ),
             kl_weight=current_kl_weight,
-            return_grad_stats=bool(args.debug_one_object),
+            return_grad_stats=True,
             use_pos_weight=args.use_pos_weight,
         )
         resume_step = 0
@@ -697,9 +810,12 @@ def main():
             f"train loss {train_loss:.4f} (recon {train_recon:.4f} kl {train_kl:.4f}) | "
             f"val loss {val_loss:.4f} (recon {val_recon:.4f} kl {val_kl:.4f}) | "
             f"val bce {val_metrics['bce']:.4f} "
+            f"val weighted_bce {val_metrics['weighted_bce']:.4f} "
             f"iou {val_metrics['iou']:.4f} "
             f"shape_ratio {val_metrics['occupancy_ratio']:.4f} "
             f"pred_ratio {val_metrics['pred_occupancy_ratio']:.4f} "
+            f"uniform_ratio {val_metrics['uniform_occupied_ratio']:.4f} "
+            f"near_ratio {val_metrics['near_occupied_ratio']:.4f} "
             f"latent_std {val_metrics['latent_std']:.4f}"
         )
         if args.debug_one_object and grad_stats is not None:
@@ -720,6 +836,7 @@ def main():
             "epoch": epoch,
             "batch_step": 0,
             "best_val_loss": best_val_loss,
+            "best_val_iou": best_val_iou,
             "target_mode": model_cfg["target_mode"],
             "architecture": model_cfg["architecture"],
             "model_config": model_cfg,
@@ -732,6 +849,10 @@ def main():
             best_val_loss = val_loss
             checkpoint["best_val_loss"] = best_val_loss
             atomic_torch_save(checkpoint, os.path.join(args.checkpoint_dir, "vae_best.pt"))
+        if val_metrics["iou"] > best_val_iou:
+            best_val_iou = val_metrics["iou"]
+            checkpoint["best_val_iou"] = best_val_iou
+            atomic_torch_save(checkpoint, os.path.join(args.checkpoint_dir, "vae_best_iou.pt"))
 
         if epoch % args.check_every == 0:
             check_reconstruction(model, val_loader, device, epoch)

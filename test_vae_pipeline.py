@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pytest
 import torch
@@ -6,8 +7,14 @@ import trimesh
 from skimage import measure
 
 from encode_latents import validate_latent_batch
+from latent_dataset import load_latent_stats, normalize_latent, denormalize_latent
 from sample_dit import decode_to_mesh
-from train_vae import evaluate_dense_grid_occupancy, collect_grad_stats, validate_checkpoint_compatibility
+from train_vae import (
+    evaluate_dense_grid_occupancy,
+    collect_grad_stats,
+    validate_checkpoint_compatibility,
+    compute_occupancy_pos_weight,
+)
 from vae_model import SkeletalVAE, vae_loss
 
 
@@ -145,6 +152,42 @@ def test_dense_grid_rejects_empty_gt_and_threshold_errors():
     model = ConstantDecoderModel()
     with pytest.raises(RuntimeError, match="does not cross threshold"):
         evaluate_dense_grid_occupancy(model, _make_sample(), device="cpu", resolution=12)
+
+
+def test_dense_grid_eval_is_deterministic_for_stochastic_decode_mode():
+    torch.manual_seed(123)
+    model = SkeletalVAE(embed_dim=32, latent_dim=8, freq_scale=4.0, decode_mode="stochastic")
+    sample = _make_sample()
+    metrics_1 = evaluate_dense_grid_occupancy(model, sample, device="cpu", resolution=12)
+    metrics_2 = evaluate_dense_grid_occupancy(model, sample, device="cpu", resolution=12)
+    assert metrics_1["dense_iou"] == pytest.approx(metrics_2["dense_iou"])
+    assert metrics_1["precision"] == pytest.approx(metrics_2["precision"])
+    assert metrics_1["recall"] == pytest.approx(metrics_2["recall"])
+
+
+def test_latent_stats_roundtrip_normalization():
+    tmp = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    mean = np.array([2.0, 3.0], dtype=np.float32)
+    std = np.array([1.0, 2.0], dtype=np.float32)
+    normalized = normalize_latent(tmp, mean, std)
+    assert np.allclose(normalized, np.array([[-1.0, -0.5], [1.0, 0.5]], dtype=np.float32))
+    denormalized = denormalize_latent(torch.from_numpy(normalized), mean, std)
+    assert torch.allclose(denormalized, torch.from_numpy(tmp))
+
+    stats_dir = "./.tmp_latent_stats"
+    os.makedirs(stats_dir, exist_ok=True)
+    np.savez(os.path.join(stats_dir, "latent_stats.npz"), latent_mean=mean, latent_std=std)
+    loaded_mean, loaded_std = load_latent_stats(stats_dir, expected_dim=2)
+    assert np.allclose(loaded_mean, mean)
+    assert np.allclose(loaded_std, std)
+    os.remove(os.path.join(stats_dir, "latent_stats.npz"))
+    os.rmdir(stats_dir)
+
+
+def test_occupancy_pos_weight_is_ratio_of_negative_to_positive_mass():
+    labels = torch.tensor([[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]], dtype=torch.float32)
+    weight = compute_occupancy_pos_weight(labels)
+    assert torch.isclose(weight, torch.tensor(4.0 / 2.0, dtype=torch.float32))
 
 
 def test_marching_cubes_coordinate_scaling():

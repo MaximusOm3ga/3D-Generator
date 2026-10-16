@@ -14,6 +14,7 @@ pip install torch numpy trimesh --break-system-packages
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 
@@ -337,10 +338,13 @@ def vae_loss(
     target_mode selects either binary occupancy or signed-distance supervision.
     """
     if target_mode == "sdf":
-        recon_loss = nn.functional.smooth_l1_loss(logits, labels, reduction="mean")
+        recon_loss = F.smooth_l1_loss(logits, labels, reduction="mean")
     else:
-        recon_loss = nn.functional.binary_cross_entropy_with_logits(
-            logits, labels, pos_weight=pos_weight
+        recon_loss = F.binary_cross_entropy_with_logits(
+            logits,
+            labels,
+            pos_weight=pos_weight,
+            reduction="mean",
         )
     kl_loss = -0.5 * torch.mean(1 + logvar - mean.pow(2) - logvar.exp())
     return recon_loss + kl_weight * kl_loss, recon_loss, kl_loss

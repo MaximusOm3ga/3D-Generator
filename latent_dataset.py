@@ -54,6 +54,58 @@ def build_manifest_from_latent_dir(
     return rows
 
 
+def validate_latent_file(latent_path: str, *, expected_tokens: Optional[int] = None, expected_dim: Optional[int] = None) -> np.ndarray:
+    with np.load(latent_path) as data:
+        if "latent" not in data:
+            raise ValueError(f"Missing latent array in {latent_path}")
+        latent = np.asarray(data["latent"], dtype=np.float32)
+        if latent.ndim != 2:
+            raise ValueError(f"Expected latent shape [tokens, dim], got {latent.shape} in {latent_path}")
+        if expected_dim is not None and latent.shape[-1] != expected_dim:
+            raise ValueError(f"Latent dim mismatch in {latent_path}: expected {expected_dim}, got {latent.shape[-1]}")
+        if expected_tokens is not None and latent.shape[0] != expected_tokens:
+            raise ValueError(f"Latent token count mismatch in {latent_path}: expected {expected_tokens}, got {latent.shape[0]}")
+        version = int(data.get("latent_version", 1))
+        if version < 1:
+            raise ValueError(f"Unsupported latent cache version in {latent_path}: {version}")
+        if not np.isfinite(latent).all():
+            raise ValueError(f"Latent cache contains non-finite values: {latent_path}")
+        return latent
+
+
+def load_latent_stats(latent_dir: str, *, expected_dim: Optional[int] = None) -> tuple[np.ndarray, np.ndarray]:
+    stats_path = os.path.join(latent_dir, "latent_stats.npz")
+    if not os.path.exists(stats_path):
+        return np.zeros(0, dtype=np.float32), np.ones(0, dtype=np.float32)
+    with np.load(stats_path, allow_pickle=False) as data:
+        if "latent_mean" not in data or "latent_std" not in data:
+            raise ValueError(f"Missing latent normalization stats in {stats_path}")
+        mean = np.asarray(data["latent_mean"], dtype=np.float32)
+        std = np.asarray(data["latent_std"], dtype=np.float32)
+        if expected_dim is not None and mean.shape[-1] != expected_dim:
+            raise ValueError(f"Latent normalization mean has wrong dimension in {stats_path}: expected {expected_dim}, got {mean.shape}")
+        if expected_dim is not None and std.shape[-1] != expected_dim:
+            raise ValueError(f"Latent normalization std has wrong dimension in {stats_path}: expected {expected_dim}, got {std.shape}")
+        std = np.where(std <= 0.0, 1.0, std)
+        return mean, std
+
+
+def normalize_latent(latent: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    if mean.size == 0 and std.size == 0:
+        return latent.astype(np.float32)
+    mean = np.asarray(mean, dtype=np.float32)
+    std = np.asarray(std, dtype=np.float32)
+    return ((latent.astype(np.float32) - mean) / std).astype(np.float32)
+
+
+def denormalize_latent(latent: torch.Tensor, mean: np.ndarray, std: np.ndarray) -> torch.Tensor:
+    if mean.size == 0 and std.size == 0:
+        return latent
+    mean = torch.as_tensor(mean, dtype=latent.dtype, device=latent.device)
+    std = torch.as_tensor(std, dtype=latent.dtype, device=latent.device)
+    return latent * std + mean
+
+
 class LatentTriplaneDataset(Dataset):
     def __init__(
         self,
@@ -68,6 +120,7 @@ class LatentTriplaneDataset(Dataset):
             self.items = build_manifest_from_latent_dir(latent_dir, split=split)
         self.latent_dir = latent_dir
         self.condition_dir = condition_dir
+        self.latent_mean, self.latent_std = load_latent_stats(latent_dir)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -79,14 +132,15 @@ class LatentTriplaneDataset(Dataset):
         latent_path = os.path.join(self.latent_dir, f"{uid}.npz")
         if not os.path.exists(latent_path):
             raise FileNotFoundError(f"Missing latent file for uid={uid}: {latent_path}")
-        latent_data = np.load(latent_path)
+        latent = validate_latent_file(latent_path)
+        latent = normalize_latent(latent, self.latent_mean, self.latent_std)
 
         sample: Dict[str, Any] = {
             "uid": uid,
             "text": item.get("text", ""),
             "image": item.get("image"),
             "source": item.get("source", "objaverse++"),
-            "latent": torch.from_numpy(latent_data["latent"].astype(np.float32)),
+            "latent": torch.from_numpy(latent.astype(np.float32)),
         }
 
         cond_path = item.get("condition_path")

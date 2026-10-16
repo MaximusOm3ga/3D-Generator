@@ -60,20 +60,28 @@ def main():
         condition_dir=args.condition_dir,
         split=args.split,
     )
-    loader = DataLoader(
-        ds,
+    if len(ds) < 2:
+        raise RuntimeError("DiT training requires at least 2 latent samples for train/validation split.")
+    train_size = max(1, int(0.9 * len(ds)))
+    val_size = max(1, len(ds) - train_size)
+    train_ds, val_ds = torch.utils.data.random_split(ds, [train_size, val_size])
+    train_loader = DataLoader(
+        train_ds,
         batch_size=args.batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=0,
         drop_last=True,
         collate_fn=latent_collate_fn,
     )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=max(1, args.batch_size),
+        shuffle=False,
+        num_workers=0,
+        drop_last=False,
+        collate_fn=latent_collate_fn,
+    )
 
-                                                                             
-                                                                    
-                                                                        
-                                                                          
-                
     sample_latent = ds[0]["latent"]
     n_tokens, latent_dim = sample_latent.shape
     print(f"Inferred latent shape from cached data: n_tokens={n_tokens} latent_dim={latent_dim}")
@@ -85,6 +93,7 @@ def main():
     start_epoch = 1
     resume_step = 0
     checkpoint = None
+    best_val_loss = float("inf")
     if args.resume and os.path.exists(args.resume):
         print(f"Resuming from {args.resume}")
         checkpoint = torch.load(args.resume, map_location=DEVICE, weights_only=False)
@@ -96,34 +105,35 @@ def main():
             start_epoch += 1
         resume_step = checkpoint.get("batch_step", 0)
         restore_rng_state(checkpoint.get("rng_state"))
+        best_val_loss = checkpoint.get("best_val_loss", float("inf"))
 
-    def save_checkpoint(epoch, batch_step):
-        atomic_torch_save(
-            {
-                "model_state": model.state_dict(),
-                "optimizer_state": opt.state_dict(),
-                "epoch": epoch,
-                "batch_step": batch_step,
-                "args": vars(args),
-                "n_tokens": n_tokens,
-                "latent_dim": latent_dim,
-                "rng_state": capture_rng_state(),
-            },
-            os.path.join(args.checkpoint_dir, "dit_last.pt"),
-        )
+    def save_checkpoint(epoch, batch_step, val_loss=None):
+        payload = {
+            "model_state": model.state_dict(),
+            "optimizer_state": opt.state_dict(),
+            "epoch": epoch,
+            "batch_step": batch_step,
+            "args": vars(args),
+            "n_tokens": n_tokens,
+            "latent_dim": latent_dim,
+            "rng_state": capture_rng_state(),
+        }
+        if val_loss is not None:
+            payload["val_loss"] = float(val_loss)
+        atomic_torch_save(payload, os.path.join(args.checkpoint_dir, "dit_last.pt"))
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         total = 0.0
         n = 0
         print(f"starting epoch {epoch}/{args.epochs}", flush=True)
-        for step, batch in enumerate(loader, start=1):
+        for step, batch in enumerate(train_loader, start=1):
             if epoch == start_epoch and step <= resume_step:
                 continue
             z0 = batch["latent"].to(DEVICE)
             bsz = z0.shape[0]
             t = torch.randint(0, TIMESTEPS, (bsz,), device=DEVICE)
-            a_t = alphas_cumprod[t].view(bsz, 1, 1)                                          
+            a_t = alphas_cumprod[t].view(bsz, 1, 1)
             eps = torch.randn_like(z0)
             zt = torch.sqrt(a_t) * z0 + torch.sqrt(1 - a_t) * eps
 
@@ -151,9 +161,43 @@ def main():
                 save_checkpoint(epoch, step)
 
         avg = total / max(n, 1)
-        print(f"epoch {epoch:03d} | diffusion loss {avg:.6f}")
+        model.eval()
+        val_total = 0.0
+        val_n = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                z0 = batch["latent"].to(DEVICE)
+                bsz = z0.shape[0]
+                t = torch.randint(0, TIMESTEPS, (bsz,), device=DEVICE)
+                a_t = alphas_cumprod[t].view(bsz, 1, 1)
+                eps = torch.randn_like(z0)
+                zt = torch.sqrt(a_t) * z0 + torch.sqrt(1 - a_t) * eps
+                clip_tokens = batch.get("clip_tokens")
+                dino_tokens = batch.get("dino_tokens")
+                clip_tokens = maybe_dropout_condition(clip_tokens.to(DEVICE) if clip_tokens is not None else None)
+                dino_tokens = maybe_dropout_condition(dino_tokens.to(DEVICE) if dino_tokens is not None else None)
+                pred_eps = model(zt, t, clip_tokens=clip_tokens, dino_tokens=dino_tokens)
+                val_total += torch.mean((pred_eps - eps) ** 2).item()
+                val_n += 1
+        val_loss = val_total / max(val_n, 1)
+        print(f"epoch {epoch:03d} | train loss {avg:.6f} | val loss {val_loss:.6f}")
         resume_step = 0
-        save_checkpoint(epoch, 0)
+        save_checkpoint(epoch, 0, val_loss=val_loss)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            atomic_torch_save(
+                {
+                    "model_state": model.state_dict(),
+                    "optimizer_state": opt.state_dict(),
+                    "epoch": epoch,
+                    "batch_step": 0,
+                    "val_loss": float(best_val_loss),
+                    "n_tokens": n_tokens,
+                    "latent_dim": latent_dim,
+                    "rng_state": capture_rng_state(),
+                },
+                os.path.join(args.checkpoint_dir, "dit_best.pt"),
+            )
 
 
 if __name__ == "__main__":

@@ -12,6 +12,64 @@ N_SKELETON_POINTS = 256
 OUTPUT_DIR = "cached_objects"
 MAX_FACES = 5000
 MODELNET_DEFAULT_CATEGORY = "airplane"
+PREPROCESS_VERSION = 2
+
+
+def cache_metadata_for_mesh(mesh, skeleton_points, object_id=None):
+    metadata = {
+        "preprocessing_version": np.array(PREPROCESS_VERSION, dtype=np.int32),
+        "normalization": np.array("center_bbox_max_extent", dtype="U32"),
+        "surface_sampling_seed": np.array(42, dtype=np.int32),
+        "anchor_sampling": np.array("farthest_point_sampling", dtype="U64"),
+        "anchor_count": np.array(N_SKELETON_POINTS, dtype=np.int32),
+        "occupancy_method": np.array("validated_mesh_contains", dtype="U64"),
+    }
+    if object_id is not None:
+        metadata["object_id"] = np.array(str(object_id), dtype="U128")
+    if mesh is not None:
+        metadata["mesh_vertices_count"] = np.array(len(mesh.vertices), dtype=np.int32)
+        metadata["mesh_faces_count"] = np.array(len(mesh.faces), dtype=np.int32)
+    if skeleton_points is not None:
+        metadata["skeleton_points_count"] = np.array(len(skeleton_points), dtype=np.int32)
+    return metadata
+
+
+def validate_cache_metadata(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    with np.load(path) as data:
+        version = int(data.get("preprocessing_version", -1))
+        if version != PREPROCESS_VERSION:
+            raise ValueError(
+                f"Cache version mismatch in {path}: found {version}, expected {PREPROCESS_VERSION}"
+            )
+        if "mesh_vertices" not in data or "mesh_faces" not in data:
+            raise ValueError(f"Missing mesh arrays in {path}")
+        if "skeleton_points" not in data:
+            raise ValueError(f"Missing skeleton_points in {path}")
+
+
+def mesh_summary(mesh):
+    if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+        return {
+            "valid": False,
+            "components": 0,
+            "watertight": False,
+            "vertices": 0,
+            "faces": 0,
+        }
+    components = mesh.split(only_watertight=False)
+    bounds = np.asarray(mesh.bounds, dtype=np.float64)
+    return {
+        "valid": bool(np.isfinite(mesh.vertices).all() and np.isfinite(mesh.faces).all()),
+        "components": len(components),
+        "watertight": bool(mesh.is_watertight),
+        "vertices": int(len(mesh.vertices)),
+        "faces": int(len(mesh.faces)),
+        "bbox_min": np.asarray(bounds[0], dtype=np.float32),
+        "bbox_max": np.asarray(bounds[1], dtype=np.float32),
+        "bbox_extents": np.asarray(bounds[1] - bounds[0], dtype=np.float32),
+    }
 
 
 def decimate_mesh(mesh, max_faces=MAX_FACES):
@@ -343,6 +401,11 @@ def repair_mesh(path, diagnostic_dir=None):
 
     export_stage(decimated, "05_normalized")
 
+    info = mesh_summary(decimated)
+    if not info["valid"]:
+        print("  normalized mesh failed final validation")
+        return None
+
     components = decimated.split(only_watertight=False)
 
     print(
@@ -448,10 +511,18 @@ def run_modelnet(dataset_root, category=MODELNET_DEFAULT_CATEGORY, max_objects=N
 
         out_path = os.path.join(output_dir, f"{uid}.npz")
         if os.path.exists(out_path):
-            kept += 1
-            elapsed = time.time() - obj_start
-            print(f"done uid={uid} status=cache_hit elapsed={elapsed:.2f}s", flush=True)
-            continue
+            try:
+                validate_cache_metadata(out_path)
+                kept += 1
+                elapsed = time.time() - obj_start
+                print(f"done uid={uid} status=cache_hit elapsed={elapsed:.2f}s", flush=True)
+                continue
+            except Exception as exc:
+                print(f"done uid={uid} status=cache_invalid reason={exc}", flush=True)
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
 
         try:
             diagnostic_dir = None
@@ -486,6 +557,7 @@ def run_modelnet(dataset_root, category=MODELNET_DEFAULT_CATEGORY, max_objects=N
                 mesh_vertices=mesh.vertices.astype(np.float32),
                 mesh_faces=mesh.faces.astype(np.int64),
                 skeleton_points=skel_points,
+                **cache_metadata_for_mesh(mesh, skel_points, object_id=uid),
             )
             kept += 1
             if kept % 50 == 0:
@@ -543,10 +615,18 @@ def run(min_score=2, max_objects=2000, category=None, dataset_root=None, source=
 
         out_path = os.path.join(OUTPUT_DIR, f"{uid}.npz")
         if os.path.exists(out_path):
-            kept += 1
-            elapsed = time.time() - obj_start
-            print(f"done uid={uid} status=cache_hit elapsed={elapsed:.2f}s", flush=True)
-            continue
+            try:
+                validate_cache_metadata(out_path)
+                kept += 1
+                elapsed = time.time() - obj_start
+                print(f"done uid={uid} status=cache_hit elapsed={elapsed:.2f}s", flush=True)
+                continue
+            except Exception as exc:
+                print(f"done uid={uid} status=cache_invalid reason={exc}", flush=True)
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
 
         try:
             mesh = repair_mesh(path)
@@ -570,6 +650,7 @@ def run(min_score=2, max_objects=2000, category=None, dataset_root=None, source=
                 mesh_vertices=mesh.vertices.astype(np.float32),
                 mesh_faces=mesh.faces.astype(np.int64),
                 skeleton_points=skel_points,
+                **cache_metadata_for_mesh(mesh, skel_points, object_id=uid),
             )
             kept += 1
             if kept % 50 == 0:

@@ -46,6 +46,7 @@ class SkeletalDiT(nn.Module):
         super().__init__()
         self.n_tokens = n_tokens
         self.latent_dim = latent_dim
+        self.pos_embed = nn.Parameter(torch.zeros(1, n_tokens, width))
         self.in_proj = nn.Linear(latent_dim, width)
         self.t_proj = nn.Sequential(
             nn.Linear(width, width),
@@ -58,8 +59,8 @@ class SkeletalDiT(nn.Module):
         self.out_proj = nn.Linear(width, latent_dim)
 
     def forward(self, z_noisy, timesteps, clip_tokens=None, dino_tokens=None):
-                                                                                
         x = self.in_proj(z_noisy)
+        x = x + self.pos_embed
 
         t_emb = timestep_embedding(timesteps, x.shape[-1])
         x = x + self.t_proj(t_emb).unsqueeze(1)
@@ -75,7 +76,7 @@ class SkeletalDiT(nn.Module):
             x = block(x, cross_tokens=cross)
 
         pred = self.out_proj(self.out_norm(x))
-        return pred                                                                       
+        return pred
 
 
 class TriplaneDiT(nn.Module):
@@ -84,6 +85,7 @@ class TriplaneDiT(nn.Module):
         self.latent_channels = latent_channels
         self.latent_res = latent_res
         self.token_count = 3 * latent_res * latent_res
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.token_count, width))
         self.in_proj = nn.Linear(latent_channels, width)
         self.t_proj = nn.Sequential(
             nn.Linear(width, width),
@@ -99,6 +101,7 @@ class TriplaneDiT(nn.Module):
         b = z_noisy.shape[0]
         x = z_noisy.view(b, self.token_count, self.latent_channels)
         x = self.in_proj(x)
+        x = x + self.pos_embed
 
         t_emb = timestep_embedding(timesteps, x.shape[-1])
         x = x + self.t_proj(t_emb).unsqueeze(1)

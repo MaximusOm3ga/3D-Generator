@@ -7,6 +7,8 @@ from torch.utils.data import DataLoader
 from dataset import SkeletalMeshDataset
 from vae_model import SkeletalVAE
 
+LATENT_CACHE_VERSION = 2
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -28,7 +30,7 @@ def parse_args():
     return p.parse_args()
 
 
-def validate_latent_batch(latents, expected_dim):
+def validate_latent_batch(latents, expected_dim, *, expected_version=LATENT_CACHE_VERSION):
     if latents.ndim != 3:
         raise ValueError(f"Expected 3D latent batch [N, tokens, dim], got shape={latents.shape}")
     if latents.shape[-1] != expected_dim:
@@ -37,6 +39,27 @@ def validate_latent_batch(latents, expected_dim):
         )
     if not np.isfinite(latents).all():
         raise ValueError(f"Cached latent values are not finite; latent shape={latents.shape}")
+    if expected_version is not None and expected_version < 1:
+        raise ValueError(f"Unsupported latent cache version: {expected_version}")
+
+
+def validate_latent_file(latent_path, expected_dim):
+    data = np.load(latent_path)
+    try:
+        if "latent" not in data:
+            raise ValueError(f"Missing latent array in {latent_path}")
+        latent = np.asarray(data["latent"], dtype=np.float32)
+        if latent.ndim != 2:
+            raise ValueError(f"Latent cache depth must be 2 [tokens, dim], got shape={latent.shape} in {latent_path}")
+        if latent.shape[-1] != expected_dim:
+            raise ValueError(f"Expected latent dim={expected_dim}, got {latent.shape[-1]} in {latent_path}")
+        version = int(data.get("latent_version", LATENT_CACHE_VERSION))
+        if version != LATENT_CACHE_VERSION:
+            raise ValueError(f"Latent cache version mismatch in {latent_path}: got {version}, expected {LATENT_CACHE_VERSION}")
+        if not np.isfinite(latent).all():
+            raise ValueError(f"Latent cache contains non-finite values: {latent_path}")
+    finally:
+        data.close()
 
 
 def main():
@@ -76,6 +99,7 @@ def main():
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     offset = 0
+    all_latents = []
     with torch.no_grad():
         for step, batch in enumerate(loader, start=1):
             xyz = batch["surface_xyz"].to(device)
@@ -89,6 +113,7 @@ def main():
                 # cache posterior means as deterministic per-object latents.
                 latents = mean.float().cpu().numpy()
                 validate_latent_batch(latents, model.encoder.to_mean.out_features)
+                all_latents.append(latents.reshape(-1, latents.shape[-1]))
 
             for i in range(latents.shape[0]):
                 src_path = ds.paths[offset + i]
@@ -104,9 +129,26 @@ def main():
                     os.path.join(args.out_dir, f"{uid}.npz"),
                     uid=uid,
                     latent=latent_i,
+                    latent_version=np.array(LATENT_CACHE_VERSION, dtype=np.int32),
+                    latent_dim=np.array(model.encoder.to_mean.out_features, dtype=np.int32),
+                    normalization=np.array("center_bbox_max_extent", dtype="U32"),
+                    latent_source=np.array("vae_posterior_mean", dtype="U32"),
+                    preprocess_version=np.array(2, dtype=np.int32),
                 )
             offset += latents.shape[0]
             print(f"encoded {offset}/{len(ds)} objects", flush=True)
+
+    if all_latents:
+        stacked = np.concatenate(all_latents, axis=0).astype(np.float32)
+        latent_mean = stacked.mean(axis=0, dtype=np.float64).astype(np.float32)
+        latent_std = stacked.std(axis=0, dtype=np.float64).astype(np.float32)
+        latent_std = np.where(latent_std <= 0.0, 1.0, latent_std)
+        np.savez(
+            os.path.join(args.out_dir, "latent_stats.npz"),
+            latent_mean=latent_mean,
+            latent_std=latent_std,
+            latent_norm_eps=np.array(1e-6, dtype=np.float32),
+        )
 
     print(f"Saved latent cache to {args.out_dir}")
 

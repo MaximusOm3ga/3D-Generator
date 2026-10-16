@@ -6,6 +6,7 @@ from skimage import measure
 import trimesh
 
 from dit_model import SkeletalDiT
+from latent_dataset import denormalize_latent, load_latent_stats
 from vae_model import SkeletalVAE
 
 
@@ -28,11 +29,17 @@ def parse_args():
     p.add_argument("--vae-ckpt", type=str, default="checkpoints/vae_best.pt")
     p.add_argument("--condition-path", type=str, default=None,
                    help="Path to conditions/<uid>.npz with clip_tokens/dino_tokens.")
+    p.add_argument("--latent-stats-path", type=str, default="cached_latents/latent_stats.npz",
+                   help="Normalization stats used to denormalize generated tokens before VAE decoding.")
     p.add_argument("--out-dir", type=str, default="samples")
     p.add_argument("--num-samples", type=int, default=1)
     p.add_argument("--timesteps", type=int, default=1000)
     p.add_argument("--sampling-steps", type=int, default=1000,
                    help="<= timesteps. Use smaller for faster, lower-quality sampling.")
+    p.add_argument("--sampler", type=str, choices=["ddim", "ddpm"], default="ddim",
+                   help="Sampling scheme used for reverse diffusion. DDIM is the default stable option.")
+    p.add_argument("--ddim-eta", type=float, default=0.0,
+                   help="DDIM stochasticity parameter. Set to 0.0 for deterministic reverse sampling.")
     p.add_argument("--cfg-scale", type=float, default=2.0,
                    help="Classifier-free guidance scale. 1.0 disables guidance.")
     p.add_argument("--resolution", type=int, default=64,
@@ -68,7 +75,7 @@ def load_condition(condition_path, device):
 
 @torch.no_grad()
 def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps, device,
-                  clip_tokens=None, dino_tokens=None, cfg_scale=1.0):
+                  clip_tokens=None, dino_tokens=None, cfg_scale=1.0, sampler="ddim", ddim_eta=0.0):
     z = torch.randn(shape, device=device)
     step_indices = torch.linspace(timesteps - 1, 0, steps=sampling_steps, device=device).long().unique()
     step_indices = step_indices.flip(0)
@@ -84,11 +91,8 @@ def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps,
             eps = eps_cond
 
         ab_t = alphas_cumprod[t].view(-1, 1, 1)
+        z0_hat = (z - torch.sqrt(1.0 - ab_t) * eps) / torch.sqrt(ab_t.clamp_min(1e-8))
 
-        z0_hat = (z - torch.sqrt(1 - ab_t) * eps) / torch.sqrt(ab_t)
-
-        # Use the ACTUAL next step in the respaced schedule, not an averaged
-        # fixed stride -- these only coincide when sampling_steps == timesteps.
         if i + 1 < len(step_indices):
             t_prev_val = int(step_indices[i + 1].item())
         else:
@@ -96,9 +100,18 @@ def sample_latent(dit, shape, alphas, alphas_cumprod, timesteps, sampling_steps,
         t_prev = torch.full((shape[0],), t_prev_val, device=device, dtype=torch.long)
         ab_prev = alphas_cumprod[t_prev].view(-1, 1, 1)
 
+        if sampler.lower() == "ddpm":
+            if int(t_idx.item()) > 0:
+                noise = torch.randn_like(z)
+                z = torch.sqrt(ab_prev) * z0_hat + torch.sqrt(1.0 - ab_prev) * noise
+            else:
+                z = z0_hat
+            continue
+
+        sigma_t = ddim_eta * torch.sqrt((1.0 - ab_prev) / (1.0 - ab_t.clamp_min(1e-8))) * torch.sqrt(1.0 - ab_t / ab_prev.clamp_min(1e-8))
         if int(t_idx.item()) > 0:
-            noise = torch.randn_like(z)
-            z = torch.sqrt(ab_prev) * z0_hat + torch.sqrt(1 - ab_prev) * noise
+            noise = torch.randn_like(z) if ddim_eta > 0 else torch.zeros_like(z)
+            z = torch.sqrt(ab_prev) * z0_hat + torch.sqrt(1.0 - ab_prev - sigma_t.pow(2)) * eps + sigma_t * noise
         else:
             z = z0_hat
     return z
@@ -206,6 +219,12 @@ def main():
 
     betas, alphas, alphas_cumprod = make_schedule(args.timesteps, device)
     clip_tokens, dino_tokens = load_condition(args.condition_path, device)
+    if os.path.exists(args.latent_stats_path):
+        stats_dir = os.path.dirname(args.latent_stats_path) or "."
+        stats_mean, stats_std = load_latent_stats(stats_dir, expected_dim=latent_dim)
+    else:
+        stats_mean = np.zeros(0, dtype=np.float32)
+        stats_std = np.ones(0, dtype=np.float32)
 
     for i in range(args.num_samples):
         latent = sample_latent(
@@ -219,7 +238,10 @@ def main():
             clip_tokens=clip_tokens,
             dino_tokens=dino_tokens,
             cfg_scale=args.cfg_scale,
+            sampler=args.sampler,
+            ddim_eta=args.ddim_eta,
         )
+        latent = denormalize_latent(latent, stats_mean, stats_std)
         mesh = decode_to_mesh_chunked(
             vae=vae,
             latent_tokens=latent,
