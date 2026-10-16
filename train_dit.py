@@ -65,12 +65,14 @@ def main():
     train_size = max(1, int(0.9 * len(ds)))
     val_size = max(1, len(ds) - train_size)
     train_ds, val_ds = torch.utils.data.random_split(ds, [train_size, val_size])
+    if len(train_ds) == 0:
+        raise RuntimeError("Training split is empty; the latent directory is too small for DiT training.")
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=0,
-        drop_last=True,
+        drop_last=False,
         collate_fn=latent_collate_fn,
     )
     val_loader = DataLoader(

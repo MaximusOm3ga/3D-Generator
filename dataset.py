@@ -6,6 +6,8 @@ import torch
 import trimesh
 from torch.utils.data import Dataset
 
+from prepare_data import PREPROCESS_VERSION, validate_cache_metadata
+
 
 def _fourier_features(points: np.ndarray, num_bands: int = 8) -> np.ndarray:
     points = points.astype(np.float32)
@@ -34,17 +36,15 @@ def farthest_point_sample(points: np.ndarray, n_points: int) -> np.ndarray:
     if len(points) == 0:
         raise ValueError("Cannot sample from an empty point cloud")
 
-    # Avoid duplicate padding if fewer points than requested while keeping the
-    # selection deterministic across repeated calls to the same object.
     if len(points) < n_points:
-        repeats = int(np.ceil(n_points / len(points)))
-        tiled = np.tile(points, (repeats, 1))[:n_points]
-        return tiled.astype(np.float32)
+        raise ValueError(
+            f"Farthest point sampling requires at least {n_points} surface points, "
+            f"but only {len(points)} were available. Reject this cache instead of silently duplicating anchors."
+        )
 
     selected = np.empty(n_points, dtype=np.int64)
     distances = np.full(len(points), np.inf, dtype=np.float32)
 
-    # Deterministic starting point.
     centroid = points.mean(axis=0)
     selected[0] = np.argmax(np.sum((points - centroid) ** 2, axis=1))
 
@@ -56,7 +56,12 @@ def farthest_point_sample(points: np.ndarray, n_points: int) -> np.ndarray:
         )
         selected[i] = np.argmax(distances)
 
-    return points[selected]
+    sampled = points[selected]
+    if len(np.unique(np.round(sampled, 6), axis=0)) < n_points:
+        raise ValueError("Farthest-point anchors are not unique enough; reject this object cache before training.")
+    return sampled.astype(np.float32)
+
+
 class SkeletalMeshDataset(Dataset):
     def __init__(
         self,
@@ -75,10 +80,18 @@ class SkeletalMeshDataset(Dataset):
         deterministic=True,
     ):
         self.paths = sorted(glob.glob(os.path.join(cache_dir, "*.npz")))
+        valid_paths = []
+        for path in self.paths:
+            try:
+                validate_cache_metadata(path)
+                valid_paths.append(path)
+            except Exception as exc:
+                print(f"Skipping incompatible cache {path}: {exc}")
+        self.paths = valid_paths
 
         if len(self.paths) == 0:
             raise RuntimeError(
-                f"No .npz files found in {cache_dir} -- run prepare_data.py first"
+                f"No valid cached objects found in {cache_dir} -- run prepare_data.py first or regenerate the cache metadata"
             )
         self.n_surface_points = n_surface_points
         self.n_query_points = n_query_points
@@ -143,6 +156,11 @@ class SkeletalMeshDataset(Dataset):
 
     def __getitem__(self, idx):
         data = np.load(self.paths[idx])
+        version = int(data.get("preprocessing_version", -1))
+        if version != PREPROCESS_VERSION:
+            raise ValueError(
+                f"Cache version mismatch for {self.paths[idx]}: found {version}, expected {PREPROCESS_VERSION}"
+            )
         mesh = trimesh.Trimesh(
             vertices=data["mesh_vertices"], faces=data["mesh_faces"], process=False
         )
@@ -160,12 +178,16 @@ class SkeletalMeshDataset(Dataset):
             query_points, occupancy_labels, sdf_labels, source_mask = self._sample_query_targets(
                 mesh, self.n_query_points, rng=rng
             )
-        # Use surface-derived anchor points instead of unreliable skeletons.
-        # The number of anchors determines the number of VAE latent tokens.
-        skeleton_points = farthest_point_sample(
-            surface_points,
-            n_points=256,
-        )
+        if "skeleton_points" in data:
+            skeleton_points = np.asarray(data["skeleton_points"], dtype=np.float32)
+            if skeleton_points.shape != (256, 3):
+                raise ValueError(
+                    f"Expected skeleton_points shape (256, 3) in {self.paths[idx]}, got {skeleton_points.shape}"
+                )
+            if not np.isfinite(skeleton_points).all():
+                raise ValueError(f"Non-finite skeleton_points in {self.paths[idx]}")
+        else:
+            skeleton_points = farthest_point_sample(surface_points, n_points=256)
 
         surface_features = [surface_points.astype(np.float32)]
         if self.include_normals:

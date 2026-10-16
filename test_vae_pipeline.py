@@ -7,7 +7,12 @@ import trimesh
 from skimage import measure
 
 from encode_latents import validate_latent_batch
-from latent_dataset import load_latent_stats, normalize_latent, denormalize_latent
+from latent_dataset import (
+    build_manifest_from_latent_dir,
+    load_latent_stats,
+    normalize_latent,
+    denormalize_latent,
+)
 from sample_dit import decode_to_mesh, make_schedule, sample_latent
 from train_vae import (
     evaluate_dense_grid_occupancy,
@@ -211,6 +216,16 @@ def test_latent_stats_roundtrip_normalization():
     assert np.allclose(loaded_std, std)
     os.remove(os.path.join(stats_dir, "latent_stats.npz"))
     os.rmdir(stats_dir)
+
+
+def test_manifest_ignores_latent_stats_and_keeps_real_latents(tmp_path):
+    real_latent = np.ones((4, 8), dtype=np.float32)
+    np.savez(tmp_path / "train_item.npz", latent=real_latent)
+    np.savez(tmp_path / "val_item.npz", latent=real_latent)
+    np.savez(tmp_path / "latent_stats.npz", latent_mean=np.zeros(8, dtype=np.float32), latent_std=np.ones(8, dtype=np.float32))
+    rows = build_manifest_from_latent_dir(str(tmp_path))
+    assert len(rows) == 2
+    assert {row["uid"] for row in rows} == {"train_item", "val_item"}
 
 
 def test_occupancy_pos_weight_is_ratio_of_negative_to_positive_mass():

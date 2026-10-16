@@ -34,7 +34,10 @@ def build_manifest_from_latent_dir(
 
     rows: List[Dict[str, Any]] = []
     for path in latent_paths:
-        uid = os.path.basename(path).replace(".npz", "")
+        filename = os.path.basename(path)
+        if filename == "latent_stats.npz":
+            continue
+        uid = filename.replace(".npz", "")
         inferred_split = None
         if "_train_" in uid:
             inferred_split = "train"

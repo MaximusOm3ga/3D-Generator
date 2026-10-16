@@ -4,9 +4,21 @@ import time
 import numpy as np
 import trimesh
 import pymeshfix
-import skeletor as sk
-import objaverse
-from datasets import load_dataset
+
+try:
+    import skeletor as sk
+except Exception:  # pragma: no cover - optional dependency for preprocessing only
+    sk = None
+
+try:
+    import objaverse
+except Exception:  # pragma: no cover - optional dependency for preprocessing only
+    objaverse = None
+
+try:
+    from datasets import load_dataset
+except Exception:  # pragma: no cover - optional dependency for preprocessing only
+    load_dataset = None
 
 N_SKELETON_POINTS = 256
 OUTPUT_DIR = "cached_objects"
@@ -48,6 +60,60 @@ def validate_cache_metadata(path):
         if "skeleton_points" not in data:
             raise ValueError(f"Missing skeleton_points in {path}")
 
+        mesh_vertices = np.asarray(data["mesh_vertices"], dtype=np.float32)
+        mesh_faces = np.asarray(data["mesh_faces"], dtype=np.int64)
+        skeleton_points = np.asarray(data["skeleton_points"], dtype=np.float32)
+
+        if mesh_vertices.ndim != 2 or mesh_vertices.shape[1] != 3:
+            raise ValueError(f"mesh_vertices has invalid shape in {path}: {mesh_vertices.shape}")
+        if mesh_faces.ndim != 2 or mesh_faces.shape[1] != 3:
+            raise ValueError(f"mesh_faces has invalid shape in {path}: {mesh_faces.shape}")
+        if skeleton_points.ndim != 2 or skeleton_points.shape[1] != 3:
+            raise ValueError(f"skeleton_points has invalid shape in {path}: {skeleton_points.shape}")
+        if not np.isfinite(mesh_vertices).all() or not np.isfinite(skeleton_points).all():
+            raise ValueError(f"Cache contains non-finite geometry in {path}")
+        if len(np.unique(np.round(skeleton_points, 6), axis=0)) < min(16, len(skeleton_points)):
+            raise ValueError(f"Skeleton anchors are too duplicated in {path}")
+
+
+def mesh_quality_summary(mesh):
+    if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+        return {
+            "valid": False,
+            "components": 0,
+            "watertight": False,
+            "vertices": 0,
+            "faces": 0,
+            "bbox_extent": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        }
+    components = mesh.split(only_watertight=False)
+    bounds = np.asarray(mesh.bounds, dtype=np.float64)
+    return {
+        "valid": bool(np.isfinite(mesh.vertices).all() and np.isfinite(mesh.faces).all()),
+        "components": len(components),
+        "watertight": bool(mesh.is_watertight),
+        "vertices": int(len(mesh.vertices)),
+        "faces": int(len(mesh.faces)),
+        "bbox_extent": np.asarray(bounds[1] - bounds[0], dtype=np.float32),
+        "volume": float(abs(mesh.volume)) if mesh.is_watertight else float("nan"),
+    }
+
+
+def validate_mesh_quality(mesh, *, max_components=10, min_extent=1e-6):
+    info = mesh_quality_summary(mesh)
+    if not info["valid"]:
+        raise ValueError("Mesh is empty or contains non-finite geometry")
+    if info["components"] <= 0:
+        raise ValueError("Mesh has no connected components")
+    if info["components"] > max_components and not info["watertight"]:
+        raise ValueError(
+            f"Mesh has too many disconnected components ({info['components']}), which makes occupancy labels unreliable"
+        )
+    extent = np.asarray(info["bbox_extent"], dtype=np.float64)
+    if not np.isfinite(extent).all() or np.any(extent <= min_extent):
+        raise ValueError("Mesh has invalid or degenerate bounding-box extents")
+    return info
+
 
 def mesh_summary(mesh):
     if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
@@ -84,7 +150,8 @@ def decimate_mesh(mesh, max_faces=MAX_FACES):
 
 
 def list_lvis_categories():
-
+    if objaverse is None:
+        raise RuntimeError("objaverse is required for LVIS category listing")
     lvis = objaverse.load_lvis_annotations()
     return sorted(lvis.keys())
 
@@ -140,7 +207,8 @@ def resolve_modelnet_paths(dataset_root, category=None, split="train"):
 
 
 def load_filtered_uids(min_score=1.2, max_objects=2000, category=None):
-
+    if load_dataset is None:
+        raise RuntimeError("datasets is required to load Objaverse metadata")
     ds = load_dataset("cindyxl/ObjaversePlusPlus", split="train")
     df = ds.to_pandas()
     bool_map = {"true": True, "false": False, True: True, False: False}
@@ -179,6 +247,8 @@ def load_filtered_uids(min_score=1.2, max_objects=2000, category=None):
 
 
 def download_meshes(uids, download_dir="~/.objaverse"):
+    if objaverse is None:
+        raise RuntimeError("objaverse is required to download meshes")
     return objaverse.load_objects(uids=uids, download_processes=4)
 
 def export_diagnostic_mesh(mesh, stage, output_dir):
@@ -406,6 +476,12 @@ def repair_mesh(path, diagnostic_dir=None):
         print("  normalized mesh failed final validation")
         return None
 
+    try:
+        validate_mesh_quality(decimated)
+    except ValueError as exc:
+        print(f"  mesh quality gate rejected: {exc}")
+        return None
+
     components = decimated.split(only_watertight=False)
 
     print(
@@ -456,6 +532,8 @@ def sample_surface_points(mesh, n_points=1024):
 
 
 def extract_skeleton_points(mesh, n_points=N_SKELETON_POINTS):
+    if sk is None:
+        raise RuntimeError("skeletor is required to extract skeleton anchors")
     fixed = sk.pre.fix_mesh(mesh, remove_disconnected=5, inplace=False)
     skel = sk.skeletonize.by_wavefront(fixed, waves=1, step_size=1)
     skeleton_verts = np.asarray(skel.vertices)
