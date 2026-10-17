@@ -20,7 +20,7 @@ cached_objects (ModelNet40 airplane .off -> .npz cache) -> VAE -> cached_latents
      --cache-dir cached_objects \
      --checkpoint-dir checkpoints \
      --epochs 200 \
-     --batch-size 1 \
+     --batch-size 8 \
      --n-surface-points 4096 \
      --n-query-points 2048 \
      --accum-steps 1 \
