@@ -7,3 +7,7 @@ samples
 *.xml
 internal.md
 checkpoints_debug_mean
+
+*.pt
+*.pth
+checkpoints_triplane
