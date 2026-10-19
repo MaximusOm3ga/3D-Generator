@@ -165,7 +165,13 @@ def decode_triplane_batch(vae: TriplaneVAE, latent: torch.Tensor, *, resolution:
         chunk = grid[start:end].unsqueeze(0)
         logits = vae.decoder(chunk, latent)
         logits_parts.append(torch.sigmoid(logits).reshape(-1))
-    occ = torch.cat(logits_parts, dim=0).reshape(resolution, resolution, resolution).cpu().numpy()
+    occ = (
+        torch.cat(logits_parts, dim=0)
+        .reshape(resolution, resolution, resolution)
+        .detach()
+        .cpu()
+        .numpy()
+    )
     if not np.isfinite(occ).all():
         raise RuntimeError("Occupancy field contains NaN or Inf")
     if float(occ.min()) >= threshold and float(occ.max()) >= threshold:
