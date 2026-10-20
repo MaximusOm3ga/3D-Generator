@@ -30,6 +30,48 @@ def _degenerate_face_threshold(mesh):
         return 1e-12
 
 
+def mesh_quality_report(mesh):
+    if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+        raise ValueError("mesh is empty")
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        raise ValueError("invalid mesh_vertices")
+    if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0:
+        raise ValueError("invalid mesh_faces")
+    if not np.isfinite(vertices).all():
+        raise ValueError("mesh has non-finite vertices")
+    if faces.min() < 0 or faces.max() >= len(vertices):
+        raise ValueError("face indices out of bounds")
+
+    tri = vertices[faces]
+    edge1 = tri[:, 1] - tri[:, 0]
+    edge2 = tri[:, 2] - tri[:, 0]
+    cross = np.cross(edge1, edge2)
+    areas = 0.5 * np.linalg.norm(cross, axis=1)
+    finite_areas = areas[np.isfinite(areas)]
+    degenerate_threshold = max(1e-12, np.median(finite_areas) * 1e-8) if finite_areas.size else 1e-12
+    degenerate_fraction = float((areas <= degenerate_threshold).sum() / max(len(areas), 1)) if len(areas) else 0.0
+    components = mesh.split(only_watertight=False)
+    component_face_sizes = [int(len(part.faces)) for part in components]
+
+    return {
+        "vertices": int(len(vertices)),
+        "faces": int(len(faces)),
+        "components": int(len(components)),
+        "component_face_sizes": component_face_sizes,
+        "watertight": bool(mesh.is_watertight),
+        "orientation_consistent": bool(mesh.is_watertight),
+        "volume": float(mesh.volume) if mesh.is_watertight and np.isfinite(mesh.volume) else float("nan"),
+        "bounds": np.asarray(mesh.bounds, dtype=np.float64),
+        "extents": np.asarray(mesh.extents, dtype=np.float64),
+        "finite_vertices": bool(np.isfinite(vertices).all()),
+        "degenerate_face_fraction": float(degenerate_fraction),
+        "degenerate_face_threshold": float(degenerate_threshold),
+    }
+
+
 def validate_cache_metadata(path):
     with np.load(path, allow_pickle=False) as d:
         if int(d.get("preprocessing_version", -1)) != PREPROCESS_VERSION:
@@ -51,19 +93,14 @@ def validate_cache_metadata(path):
         if s.shape != (N_SKELETON_POINTS, 3):
             raise ValueError("invalid skeleton_points")
 
-        tri = v[f]
-        edge1 = tri[:, 1] - tri[:, 0]
-        edge2 = tri[:, 2] - tri[:, 0]
-        cross = np.cross(edge1, edge2)
-        areas = 0.5 * np.linalg.norm(cross, axis=1)
-        if not np.isfinite(areas).all():
-            raise ValueError("mesh contains non-finite face areas")
-        threshold = max(1e-12, np.median(areas[np.isfinite(areas)]) * 1e-8) if areas.size else 1e-12
-        if (areas <= threshold).any():
-            # A tiny fraction of sliver faces is common in raw ModelNet meshes; reject only if the mesh is
-            # effectively degenerate instead of filtering out whole valid airplanes.
-            if (areas <= threshold).mean() > 0.25:
-                raise ValueError("mesh contains degenerate faces with near-zero area")
+        mesh = trimesh.Trimesh(vertices=v, faces=f, process=False)
+        report = mesh_quality_report(mesh)
+        if not report["watertight"]:
+            raise ValueError("cache mesh is not watertight; occupancy labels are not trustworthy")
+        if report["degenerate_face_fraction"] > 0.25:
+            raise ValueError("mesh contains degenerate faces with near-zero area")
+        if not np.isfinite(report["volume"]) and report["faces"] > 0:
+            raise ValueError("mesh volume is non-finite despite being watertight")
 
 
 def clean_mesh(mesh):

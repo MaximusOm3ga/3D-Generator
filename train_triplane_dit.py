@@ -6,24 +6,44 @@ import torch
 from torch.utils.data import DataLoader
 
 from dit_model import TriplaneDiT
-from triplane_pipeline import load_triplane_stats, make_triplane_schedule, restore_triplane_numpy
+from triplane_pipeline import load_triplane_stats, make_triplane_schedule
+
+
+def _latent_shape_to_res_channels(latent_shape):
+    if len(latent_shape) != 2:
+        raise ValueError(f"Expected flattened latent [tokens, channels], got {latent_shape}")
+    tokens, channels = latent_shape
+    if tokens % 3 != 0:
+        raise ValueError(f"Token count {tokens} is not divisible by 3 for a triplane latent")
+    latent_res = int(round(np.sqrt(tokens / 3)))
+    if latent_res * latent_res * 3 != tokens:
+        raise ValueError(f"Token count {tokens} is not valid for a 3x{latent_res}x{latent_res} layout")
+    return latent_res, channels
 
 
 class TriplaneLatentDataset(torch.utils.data.Dataset):
     def __init__(self, latent_dir: str, split: str):
+        self.stats_mean, self.stats_std = load_triplane_stats(latent_dir)
+        if self.stats_mean.size == 0 or self.stats_std.size == 0:
+            raise ValueError(f"Missing train-only latent normalization stats in {latent_dir}/latent_stats.npz")
         self.items = []
         for p in sorted(os.listdir(latent_dir)):
             if not p.endswith(".npz") or p == "latent_stats.npz":
                 continue
             full = os.path.join(latent_dir, p)
-            data = np.load(full, allow_pickle=False)
-            item_split = str(data.get("split", "train"))
-            if split != "all" and item_split.lower() != split.lower():
-                continue
-            latent = np.asarray(data["latent"], dtype=np.float32)
-            if latent.ndim != 2:
-                raise ValueError(f"Expected latent shape [tokens, channels], got {latent.shape}")
-            self.items.append({"uid": p.replace(".npz", ""), "latent": latent, "split": item_split})
+            with np.load(full, allow_pickle=False) as data:
+                item_split = str(data.get("split", "train")).lower()
+                allowed = {"train", "val", "test"}
+                if item_split not in allowed:
+                    raise ValueError(f"Invalid split {item_split!r} in {p}; expected one of {sorted(allowed)}")
+                if split != "all" and item_split != split.lower():
+                    continue
+                latent = np.asarray(data["latent"], dtype=np.float32)
+                if latent.ndim != 2:
+                    raise ValueError(f"Expected latent shape [tokens, channels], got {latent.shape}")
+                if latent.shape[-1] != self.stats_mean.shape[-1]:
+                    raise ValueError(f"Latent dim mismatch: latent={latent.shape[-1]}, stats={self.stats_mean.shape[-1]}")
+                self.items.append({"uid": p.replace(".npz", ""), "latent": latent, "split": item_split})
         if not self.items:
             raise RuntimeError(f"No latent files found for split={split!r} in {latent_dir}")
 
@@ -33,8 +53,9 @@ class TriplaneLatentDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         item = self.items[idx]
         latent = item["latent"].astype(np.float32)
-        latent = restore_triplane_numpy(latent.reshape(1, latent.shape[0], latent.shape[1]), 8, latent.shape[1])
-        return {"uid": item["uid"], "latent": torch.from_numpy(latent[0].astype(np.float32))}
+        if self.stats_mean.size and self.stats_std.size:
+            latent = (latent - self.stats_mean) / np.where(self.stats_std <= 1e-6, 1.0, self.stats_std)
+        return {"uid": item["uid"], "latent": torch.from_numpy(latent.astype(np.float32)), "split": item["split"]}
 
 
 def parse_args():
@@ -59,12 +80,12 @@ def main():
     device = torch.device(args.device)
     dataset = TriplaneLatentDataset(args.latent_dir, split=args.split)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    sample_latent = dataset[0]["latent"]
-    latent_channels = sample_latent.shape[-1]
-    latent_res = int(np.sqrt(sample_latent.shape[1] // 3))
+    sample = dataset[0]["latent"]
+    latent_channels = sample.shape[-1]
+    latent_res, _ = _latent_shape_to_res_channels((sample.shape[0], latent_channels))
     model = TriplaneDiT(latent_channels=latent_channels, latent_res=latent_res, width=64, depth=2, heads=4).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    betas, _, alphas_cumprod = make_triplane_schedule(args.timesteps, device)
+    _, _, alphas_cumprod = make_triplane_schedule(args.timesteps, device)
     best_loss = float("inf")
     for epoch in range(args.epochs):
         model.train()

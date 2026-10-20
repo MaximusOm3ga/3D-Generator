@@ -117,6 +117,11 @@ class SkeletalMeshDataset(Dataset):
     def _sample_occupancy(self, mesh, n_points, rng=None):
         if rng is None:
             rng = np.random.default_rng()
+        if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            raise ValueError("mesh is empty; cannot sample occupancy targets")
+        if not mesh.is_watertight:
+            raise ValueError("open or non-watertight mesh cannot produce trustworthy occupancy labels")
+
         n_uniform = n_points // 2
         n_near = n_points - n_uniform
 
@@ -141,6 +146,10 @@ class SkeletalMeshDataset(Dataset):
         )
 
         labels = mesh.contains(query_points).astype(np.float32)
+        if labels.size == 0 or not np.isfinite(labels).all():
+            raise ValueError("occupancy labels are empty or contain NaN/Inf values")
+        if np.all(labels == 0.0) or np.all(labels == 1.0):
+            raise ValueError("degenerate occupancy labels detected; reject this mesh before training")
         return query_points, labels, source_mask
 
     def _sample_query_targets(self, mesh, n_points, rng=None):

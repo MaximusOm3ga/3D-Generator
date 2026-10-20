@@ -66,7 +66,7 @@ def main():
             seed=args.seed + i,
         )
         z = denormalize_latent(z, stats_mean, stats_std)
-        mesh = extract_triplane_mesh(vae, z[0], resolution=args.resolution, threshold=args.threshold, batch_size=16384)
+        mesh = extract_triplane_mesh(vae, z, resolution=args.resolution, threshold=args.threshold, batch_size=16384)
         out_path = os.path.join(args.out_dir, f"sample_{i:03d}.obj")
         mesh.export(out_path)
         print(f"Saved {out_path} with {len(mesh.vertices)} vertices and {len(mesh.faces)} faces")

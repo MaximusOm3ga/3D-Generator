@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import trimesh
 from skimage import measure
 
+from dataset import SkeletalMeshDataset
 from encode_latents import validate_latent_batch
 from latent_dataset import (
     build_manifest_from_latent_dir,
@@ -14,6 +15,7 @@ from latent_dataset import (
     denormalize_latent,
 )
 from sample_dit import decode_to_mesh, make_schedule, sample_latent
+from prepare_data import PREPROCESS_VERSION, validate_cache_metadata
 from train_vae import (
     evaluate_dense_grid_occupancy,
     collect_grad_stats,
@@ -206,6 +208,37 @@ def test_dense_grid_rejects_empty_gt_and_threshold_errors():
     model = ConstantDecoderModel()
     with pytest.raises(RuntimeError, match="does not cross threshold"):
         evaluate_dense_grid_occupancy(model, _make_sample(), device="cpu", resolution=12)
+
+
+def test_open_mesh_is_rejected_for_occupancy_sampling():
+    open_mesh = trimesh.Trimesh(
+        vertices=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        faces=np.array([[0, 1, 2]], dtype=np.int64),
+        process=False,
+    )
+    ds = SkeletalMeshDataset.__new__(SkeletalMeshDataset)
+    ds.near_surface_std = 0.01
+    ds.target_mode = "occupancy"
+    with pytest.raises(ValueError, match="watertight|occupancy"):
+        ds._sample_occupancy(open_mesh, 32, np.random.default_rng(0))
+
+
+def test_validate_cache_metadata_rejects_open_mesh(tmp_path):
+    open_mesh = trimesh.Trimesh(
+        vertices=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        faces=np.array([[0, 1, 2]], dtype=np.int64),
+        process=False,
+    )
+    cache_path = tmp_path / "open_mesh.npz"
+    np.savez(
+        cache_path,
+        mesh_vertices=open_mesh.vertices.astype(np.float32),
+        mesh_faces=open_mesh.faces.astype(np.int64),
+        skeleton_points=np.zeros((256, 3), dtype=np.float32),
+        preprocessing_version=np.array(PREPROCESS_VERSION, dtype=np.int32),
+    )
+    with pytest.raises(ValueError, match="watertight|occupancy"):
+        validate_cache_metadata(str(cache_path))
 
 
 def test_dense_grid_eval_is_deterministic_for_stochastic_decode_mode():

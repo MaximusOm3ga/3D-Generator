@@ -5,12 +5,16 @@ import pytest
 import torch
 
 from dit_model import TriplaneDiT
+from encode_triplane_latents import compute_channelwise_stats
 from triplane_pipeline import (
     DEFAULT_TRIPLANE_CONFIG,
+    decode_triplane_batch,
     flatten_triplane_numpy,
+    normalize_latent,
     restore_triplane_numpy,
     sample_triplane_latent,
     make_triplane_schedule,
+    save_triplane_latent,
 )
 from vae_model import TriplaneVAE
 
@@ -84,6 +88,40 @@ def test_triplane_latent_flatten_roundtrip():
     assert np.allclose(restored, latent.numpy())
 
 
+def test_triplane_channelwise_normalization_and_split_roundtrip(tmp_path):
+    latent = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    mean = np.array([2.0, 3.0], dtype=np.float32)
+    std = np.array([1.0, 2.0], dtype=np.float32)
+    normalized = normalize_latent(latent, mean, std)
+    assert normalized.shape == (2, 2)
+    assert np.allclose(normalized[0], [-1.0, -0.5], atol=1e-6)
+
+    path = tmp_path / "train_item.npz"
+    save_triplane_latent(path, latent, uid="train_item", split="train", vae_ckpt="demo.ckpt")
+    with np.load(path, allow_pickle=False) as data:
+        assert str(data["split"]) == "train"
+        assert data["latent"][0, 0] == 1.0
+
+
+def test_triplane_train_stats_are_channelwise_and_exclude_val_data():
+    train_latents = [
+        np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+        np.array([[5.0, 6.0], [7.0, 8.0]], dtype=np.float32),
+    ]
+    val_latents = [np.array([[100.0, 100.0], [100.0, 100.0]], dtype=np.float32)]
+    mean, std = compute_channelwise_stats(np.concatenate(train_latents, axis=0))
+    assert mean.shape == (2,)
+    assert std.shape == (2,)
+    assert np.allclose(mean, np.array([4.0, 5.0], dtype=np.float32), atol=1e-6)
+    assert np.allclose(std, np.sqrt(np.array([5.0, 5.0], dtype=np.float32)), atol=1e-6)
+    assert not np.allclose(mean, np.concatenate(val_latents, axis=0).mean(axis=0))
+
+
+def test_triplane_split_metadata_and_stats_require_valid_values():
+    with pytest.raises(ValueError, match="Invalid triplane latent split"):
+        save_triplane_latent("/tmp/invalid_split.npz", np.ones((2, 2), dtype=np.float32), uid="bad", split="all", vae_ckpt="demo.ckpt")
+
+
 def test_triplane_deterministic_schedule_and_sampling():
     torch.manual_seed(7)
     dit = TriplaneDiT(latent_channels=2, latent_res=4, width=16, depth=2, heads=4)
@@ -107,6 +145,22 @@ def test_triplane_decoder_chunked_equivalence_small_grid():
     chunked = torch.cat(chunked, dim=1)
     assert chunked.shape == full.shape
     assert torch.allclose(chunked, full, atol=1e-5, rtol=1e-5)
+
+
+def test_triplane_vae_rejects_incompatible_feature_count():
+    with pytest.raises(ValueError, match="in_channels=.*54"):
+        TriplaneVAE(in_channels=53, hidden_dim=16, latent_channels=2, latent_res=4)
+
+
+def test_triplane_decode_rejects_field_without_threshold_crossing():
+    class DummyVAE:
+        def __init__(self):
+            self.decoder = lambda query_points, latent: torch.full((query_points.shape[0], query_points.shape[1]), -5.0)
+            self.parameters = lambda: iter([torch.nn.Parameter(torch.zeros(1))])
+
+    latent = torch.zeros(1, 3, 4, 4, 2)
+    with pytest.raises(RuntimeError, match="does not cross threshold"):
+        decode_triplane_batch(DummyVAE(), latent, resolution=4, batch_size=8, device=torch.device('cpu'), threshold=0.5)
 
 
 def test_existing_skeletal_imports_and_tensor_shapes_still_work():

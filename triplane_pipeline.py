@@ -80,6 +80,19 @@ def restore_triplane_numpy(latent: np.ndarray, latent_res: int, latent_channels:
     raise ValueError(f"Unsupported latent shape: {latent.shape}")
 
 
+def _as_channelwise_stats(mean: np.ndarray, std: np.ndarray, *, eps: float = 1e-6) -> tuple[np.ndarray, np.ndarray]:
+    mean = np.asarray(mean, dtype=np.float32)
+    std = np.asarray(std, dtype=np.float32)
+    if mean.ndim != 1:
+        raise ValueError(f"Expected channel-wise mean shape [C], got {mean.shape}")
+    if std.ndim != 1:
+        raise ValueError(f"Expected channel-wise std shape [C], got {std.shape}")
+    if mean.shape != std.shape:
+        raise ValueError(f"Mean/std shape mismatch: mean={mean.shape}, std={std.shape}")
+    std = np.where(std <= eps, 1.0, std)
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
 def normalize_latent(latent: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     latent = np.asarray(latent, dtype=np.float32)
     mean = np.asarray(mean, dtype=np.float32)
@@ -88,7 +101,8 @@ def normalize_latent(latent: np.ndarray, mean: np.ndarray, std: np.ndarray) -> n
         return latent
     if latent.shape[-1] != mean.shape[-1]:
         raise ValueError(f"Latent dimension mismatch: latent={latent.shape}, mean={mean.shape}")
-    return ((latent - mean) / np.where(std <= 0.0, 1.0, std)).astype(np.float32)
+    std = np.where(std <= 1e-6, 1.0, std)
+    return ((latent - mean) / std).astype(np.float32)
 
 
 def denormalize_latent(latent: Union[np.ndarray, torch.Tensor], mean: np.ndarray, std: np.ndarray):
@@ -99,9 +113,11 @@ def denormalize_latent(latent: Union[np.ndarray, torch.Tensor], mean: np.ndarray
     if isinstance(latent, torch.Tensor):
         mean_t = torch.as_tensor(mean, dtype=latent.dtype, device=latent.device)
         std_t = torch.as_tensor(std, dtype=latent.dtype, device=latent.device)
+        std_t = torch.where(std_t <= 1e-6, torch.ones_like(std_t), std_t)
         return latent * std_t + mean_t
     latent = np.asarray(latent, dtype=np.float32)
-    return (latent * np.where(std <= 0.0, 1.0, std) + mean).astype(np.float32)
+    safe_std = np.where(std <= 1e-6, 1.0, std)
+    return (latent * safe_std + mean).astype(np.float32)
 
 
 def save_triplane_latent(path: str, latent: np.ndarray, *, uid: str, split: str, vae_ckpt: str, latent_version: int = 1, preprocess_version: int = 3, latent_shape: Optional[Tuple[int, ...]] = None, latent_mean: Optional[np.ndarray] = None, latent_std: Optional[np.ndarray] = None):
@@ -109,13 +125,16 @@ def save_triplane_latent(path: str, latent: np.ndarray, *, uid: str, split: str,
     latent = np.asarray(latent, dtype=np.float32)
     if latent.ndim != 2:
         raise ValueError(f"Expected latent shape [tokens, channels], got {latent.shape}")
+    split_name = str(split).lower()
+    if split_name not in {"train", "val", "test"}:
+        raise ValueError(f"Invalid triplane latent split={split!r}; expected one of train/val/test")
     payload = {
         "uid": np.asarray(uid, dtype="U128"),
         "latent": latent,
         "latent_version": np.array(latent_version, dtype=np.int32),
         "latent_dim": np.array(latent.shape[-1], dtype=np.int32),
         "latent_shape": np.asarray(latent_shape if latent_shape is not None else latent.shape, dtype=np.int32),
-        "split": np.asarray(split, dtype="U16"),
+        "split": np.asarray(split_name, dtype="U16"),
         "vae_ckpt": np.asarray(vae_ckpt, dtype="U512"),
         "preprocess_version": np.array(preprocess_version, dtype=np.int32),
     }
@@ -133,21 +152,36 @@ def load_triplane_stats(latent_dir: str, *, expected_dim: Optional[int] = None):
     with np.load(stats_path, allow_pickle=False) as data:
         mean = np.asarray(data["latent_mean"], dtype=np.float32)
         std = np.asarray(data["latent_std"], dtype=np.float32)
+        if mean.ndim != 1:
+            raise ValueError(f"Expected channel-wise latent_mean shape [C], got {mean.shape}")
+        if std.ndim != 1:
+            raise ValueError(f"Expected channel-wise latent_std shape [C], got {std.shape}")
         if expected_dim is not None and mean.shape[-1] != expected_dim:
             raise ValueError(f"Expected latent dim={expected_dim}, got mean dim={mean.shape}")
         std = np.where(std <= 0.0, 1.0, std)
-        return mean, std
+        return mean.astype(np.float32), std.astype(np.float32)
 
 
 def ensure_triplane_checkpoint_compatibility(checkpoint, run_cfg):
     ckpt_cfg = checkpoint.get("model_config") or checkpoint.get("args") or {}
     if not ckpt_cfg:
         raise ValueError("Checkpoint missing model_config metadata")
-    for key in ("in_channels", "hidden_dim", "latent_channels", "latent_res", "decoder_hidden_dim", "target_mode"):
-        if key not in ckpt_cfg and key in run_cfg:
+    required = {
+        "in_channels": 54,
+        "hidden_dim": run_cfg.get("hidden_dim"),
+        "latent_channels": run_cfg.get("latent_channels"),
+        "latent_res": run_cfg.get("latent_res"),
+        "decoder_hidden_dim": run_cfg.get("decoder_hidden_dim"),
+        "target_mode": run_cfg.get("target_mode", "occupancy"),
+    }
+    for key, expected in required.items():
+        if expected is None:
             continue
-        if key in ckpt_cfg and key in run_cfg and ckpt_cfg[key] != run_cfg[key]:
-            raise ValueError(f"Checkpoint incompatible: {key} mismatch ({ckpt_cfg[key]} != {run_cfg[key]})")
+        value = ckpt_cfg.get(key)
+        if value is None:
+            continue
+        if value != expected:
+            raise ValueError(f"Checkpoint incompatible: {key} mismatch ({value} != {expected})")
 
 
 def make_lattice_points(resolution: int, device: torch.device):
@@ -157,13 +191,24 @@ def make_lattice_points(resolution: int, device: torch.device):
 
 
 def decode_triplane_batch(vae: TriplaneVAE, latent: torch.Tensor, *, resolution: int, batch_size: int = 16384, device: torch.device = torch.device("cpu"), threshold: float = 0.5):
+    if latent.dim() == 5:
+        if latent.shape[0] == 1:
+            decoder_latent = latent[0].unsqueeze(0)
+        else:
+            raise ValueError(f"Expected unbatched or singleton triplane latent, got shape {tuple(latent.shape)}")
+    elif latent.dim() == 4:
+        decoder_latent = latent.unsqueeze(0)
+    else:
+        raise ValueError(f"Expected latent shape [3,H,W,C] or [B,3,H,W,C], got {tuple(latent.shape)}")
+    if decoder_latent.shape[1] != 3:
+        raise ValueError(f"Expected first latent plane dimension 3, got {decoder_latent.shape}")
     grid = make_lattice_points(resolution, device)
     logits_parts = []
-    latent = latent.to(device)
+    decoder_latent = decoder_latent.to(device)
     for start in range(0, grid.shape[0], batch_size):
         end = min(start + batch_size, grid.shape[0])
         chunk = grid[start:end].unsqueeze(0)
-        logits = vae.decoder(chunk, latent)
+        logits = vae.decoder(chunk, decoder_latent)
         logits_parts.append(torch.sigmoid(logits).reshape(-1))
     occ = (
         torch.cat(logits_parts, dim=0)
@@ -174,14 +219,21 @@ def decode_triplane_batch(vae: TriplaneVAE, latent: torch.Tensor, *, resolution:
     )
     if not np.isfinite(occ).all():
         raise RuntimeError("Occupancy field contains NaN or Inf")
-    if float(occ.min()) >= threshold and float(occ.max()) >= threshold:
-        raise RuntimeError(f"Occupancy field does not cross threshold={threshold}; min={float(occ.min()):.5f}, max={float(occ.max()):.5f}")
     if occ.size == 0:
         raise RuntimeError("Occupancy field is empty")
+    if not (float(occ.min()) < threshold < float(occ.max())):
+        raise RuntimeError(
+            f"Occupancy field does not cross threshold={threshold}; min={float(occ.min()):.5f}, max={float(occ.max()):.5f}. "
+            "No automatic threshold fallback is allowed."
+        )
     return occ
 
 
 def extract_triplane_mesh(vae: TriplaneVAE, latent: torch.Tensor, *, resolution: int = 32, threshold: float = 0.5, batch_size: int = 16384, unit_scale: float = 1.0):
+    if latent.dim() == 5 and latent.shape[0] == 1:
+        latent = latent[0]
+    if latent.dim() == 5 and latent.shape[0] != 1:
+        raise ValueError(f"Batch-wise latent decoding is not supported here; expected unbatched [3,H,W,C] or [1,3,H,W,C], got {tuple(latent.shape)}")
     occ = decode_triplane_batch(vae, latent, resolution=resolution, batch_size=batch_size, device=next(vae.parameters()).device, threshold=threshold)
     verts, faces, _, _ = measure.marching_cubes(occ, level=threshold)
     if len(faces) == 0:

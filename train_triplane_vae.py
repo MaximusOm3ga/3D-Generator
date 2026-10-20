@@ -87,9 +87,13 @@ def main():
             xyz = batch["surface_xyz"].to(device)
             query_points = batch["query_points"].to(device)
             labels = batch["occupancy_labels"].to(device)
+            pos_weight = None
+            if args.target_mode == "occupancy":
+                positive_fraction = labels.float().mean().clamp_min(1e-6)
+                pos_weight = ((1.0 - positive_fraction) / positive_fraction).clamp_min(1.0)
             with torch.autocast(device_type="cuda", enabled=(args.amp and device.type == "cuda")):
                 logits, mean, logvar = model(surface, xyz, query_points)
-                loss, _, _ = vae_loss(logits, labels, mean, logvar, kl_weight=args.kl_weight, target_mode=args.target_mode)
+                loss, _, _ = vae_loss(logits, labels, mean, logvar, kl_weight=args.kl_weight, pos_weight=pos_weight, target_mode=args.target_mode)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -104,8 +108,12 @@ def main():
                 xyz = batch["surface_xyz"].to(device)
                 query_points = batch["query_points"].to(device)
                 labels = batch["occupancy_labels"].to(device)
+                pos_weight = None
+                if args.target_mode == "occupancy":
+                    positive_fraction = labels.float().mean().clamp_min(1e-6)
+                    pos_weight = ((1.0 - positive_fraction) / positive_fraction).clamp_min(1.0)
                 logits, mean, logvar = model(surface, xyz, query_points)
-                loss, _, _ = vae_loss(logits, labels, mean, logvar, kl_weight=args.kl_weight, target_mode=args.target_mode)
+                loss, _, _ = vae_loss(logits, labels, mean, logvar, kl_weight=args.kl_weight, pos_weight=pos_weight, target_mode=args.target_mode)
                 val_loss += loss.item()
                 val_steps += 1
         train_loss /= max(train_steps, 1)

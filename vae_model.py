@@ -185,6 +185,12 @@ class ConditionProjector(nn.Module):
 class TriplaneLatentVAE(nn.Module):
     def __init__(self, in_channels=54, hidden_dim=768, latent_channels=16, latent_res=32):
         super().__init__()
+        expected_in_channels = 3 + 3 + 48
+        if in_channels != expected_in_channels:
+            raise ValueError(
+                f"TriplaneVAE requires in_channels={expected_in_channels} "
+                f"(XYZ + normals + 8-band Fourier), got {in_channels}"
+            )
         self.in_channels = in_channels
         self.hidden_dim = hidden_dim
         self.latent_channels = latent_channels
@@ -259,6 +265,8 @@ class TriplaneDecoder(nn.Module):
 
     def __init__(self, latent_channels=16, embed_dim=128, hidden_dim=128):
         super().__init__()
+        self.latent_channels = int(latent_channels)
+        self.embed_dim = int(embed_dim)
         self.pos_embed = PointEmbed(out_dim=embed_dim)
         self.mlp = nn.Sequential(
             nn.Linear(latent_channels + embed_dim, hidden_dim),
@@ -277,6 +285,13 @@ class TriplaneDecoder(nn.Module):
         return sampled.squeeze(-1).transpose(1, 2)             
 
     def forward(self, query_points, triplane_latent):
+        if query_points.dim() != 3 or query_points.shape[-1] != 3:
+            raise ValueError(f"Expected query_points shape [B,N,3], got {tuple(query_points.shape)}")
+        if triplane_latent.dim() != 5:
+            raise ValueError(f"Expected triplane latent shape [B,3,H,W,C], got {tuple(triplane_latent.shape)}")
+        if triplane_latent.shape[1] != 3:
+            raise ValueError(f"Expected 3 plane tensors, got shape {tuple(triplane_latent.shape)}")
+
         xy_img = triplane_latent[:, 0].permute(0, 3, 1, 2)
         yz_img = triplane_latent[:, 1].permute(0, 3, 1, 2)
         xz_img = triplane_latent[:, 2].permute(0, 3, 1, 2)
@@ -302,6 +317,16 @@ class TriplaneVAE(nn.Module):
         decoder_hidden_dim=128,
     ):
         super().__init__()
+        expected_in_channels = 3 + 3 + 48
+        if in_channels != expected_in_channels:
+            raise ValueError(
+                f"TriplaneVAE requires in_channels={expected_in_channels} "
+                f"(XYZ + normals + 8-band Fourier), got {in_channels}"
+            )
+        self.in_channels = int(in_channels)
+        self.hidden_dim = int(hidden_dim)
+        self.latent_channels = int(latent_channels)
+        self.latent_res = int(latent_res)
         self.encoder = TriplaneLatentVAE(
             in_channels=in_channels,
             hidden_dim=hidden_dim,
@@ -336,13 +361,21 @@ def vae_loss(
 ):
     """
     target_mode selects either binary occupancy or signed-distance supervision.
+    When occupancy labels are sparse, auto-balance the positive class so the
+    decoder learns to produce threshold-crossing logits instead of collapsing to a
+    low-probability background mode.
     """
     if target_mode == "sdf":
         recon_loss = F.smooth_l1_loss(logits, labels, reduction="mean")
     else:
+        if pos_weight is None:
+            positive_fraction = labels.float().mean().clamp_min(1e-6)
+            pos_weight = (1.0 - positive_fraction) / positive_fraction
+            pos_weight = pos_weight.clamp_min(1.0)
+        pos_weight = torch.as_tensor(pos_weight, device=logits.device, dtype=logits.dtype)
         recon_loss = F.binary_cross_entropy_with_logits(
             logits,
-            labels,
+            labels.float(),
             pos_weight=pos_weight,
             reduction="mean",
         )
