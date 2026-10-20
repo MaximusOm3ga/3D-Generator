@@ -30,6 +30,7 @@ def parse_args():
     p.add_argument("--cache-dir", type=str, default="cached_objects")
     p.add_argument("--out-dir", type=str, default="cached_triplane_latents")
     p.add_argument("--split", type=str, choices=["train", "val", "test", "all"], default="all")
+    p.add_argument("--target-mode", type=str, choices=["occupancy", "udf"], default="occupancy")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -79,9 +80,10 @@ def main():
         cache_dir=args.cache_dir,
         n_surface_points=256,
         n_query_points=512,
-        include_occupancy=True,
+        include_occupancy=(args.target_mode == "occupancy"),
+        include_udf=(args.target_mode == "udf"),
         include_sdf=False,
-        target_mode="occupancy",
+        target_mode=args.target_mode,
     )
     chosen_paths = pick_data_paths(dataset, args.split)
     train_latents = []

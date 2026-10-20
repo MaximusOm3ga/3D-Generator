@@ -20,6 +20,8 @@ DEFAULT_TRIPLANE_CONFIG = {
     "latent_res": 8,
     "decoder_hidden_dim": 64,
     "target_mode": "occupancy",
+    "field_parameterization": "occupancy",
+    "udf_level": 0.0,
     "preprocessing_version": 3,
 }
 
@@ -190,7 +192,7 @@ def make_lattice_points(resolution: int, device: torch.device):
     return mesh
 
 
-def decode_triplane_batch(vae: TriplaneVAE, latent: torch.Tensor, *, resolution: int, batch_size: int = 16384, device: torch.device = torch.device("cpu"), threshold: float = 0.5):
+def decode_triplane_batch(vae: TriplaneVAE, latent: torch.Tensor, *, resolution: int, batch_size: int = 16384, device: torch.device = torch.device("cpu"), threshold: float = 0.5, target_mode: str = "occupancy"):
     if latent.dim() == 5:
         if latent.shape[0] == 1:
             decoder_latent = latent[0].unsqueeze(0)
@@ -202,6 +204,9 @@ def decode_triplane_batch(vae: TriplaneVAE, latent: torch.Tensor, *, resolution:
         raise ValueError(f"Expected latent shape [3,H,W,C] or [B,3,H,W,C], got {tuple(latent.shape)}")
     if decoder_latent.shape[1] != 3:
         raise ValueError(f"Expected first latent plane dimension 3, got {decoder_latent.shape}")
+    target_mode = str(target_mode).lower()
+    if target_mode not in {"occupancy", "udf"}:
+        raise ValueError(f"Unsupported target_mode={target_mode!r}; expected 'occupancy' or 'udf'.")
     grid = make_lattice_points(resolution, device)
     logits_parts = []
     decoder_latent = decoder_latent.to(device)
@@ -209,35 +214,45 @@ def decode_triplane_batch(vae: TriplaneVAE, latent: torch.Tensor, *, resolution:
         end = min(start + batch_size, grid.shape[0])
         chunk = grid[start:end].unsqueeze(0)
         logits = vae.decoder(chunk, decoder_latent)
-        logits_parts.append(torch.sigmoid(logits).reshape(-1))
-    occ = (
+        if target_mode == "occupancy":
+            logits_parts.append(torch.sigmoid(logits).reshape(-1))
+        else:
+            logits_parts.append(logits.reshape(-1))
+    field = (
         torch.cat(logits_parts, dim=0)
         .reshape(resolution, resolution, resolution)
         .detach()
         .cpu()
         .numpy()
     )
-    if not np.isfinite(occ).all():
-        raise RuntimeError("Occupancy field contains NaN or Inf")
-    if occ.size == 0:
-        raise RuntimeError("Occupancy field is empty")
-    if not (float(occ.min()) < threshold < float(occ.max())):
-        raise RuntimeError(
-            f"Occupancy field does not cross threshold={threshold}; min={float(occ.min()):.5f}, max={float(occ.max()):.5f}. "
-            "No automatic threshold fallback is allowed."
-        )
-    return occ
+    if not np.isfinite(field).all():
+        raise RuntimeError("Decoded field contains NaN or Inf")
+    if field.size == 0:
+        raise RuntimeError("Decoded field is empty")
+    if target_mode == "occupancy":
+        if not (float(field.min()) < threshold < float(field.max())):
+            raise RuntimeError(
+                f"Occupancy field does not cross threshold={threshold}; min={float(field.min()):.5f}, max={float(field.max()):.5f}. "
+                "No automatic threshold fallback is allowed."
+            )
+    else:
+        if not (float(field.min()) <= threshold <= float(field.max())):
+            raise RuntimeError(
+                f"UDF field does not cross extraction level={threshold}; min={float(field.min()):.5f}, max={float(field.max()):.5f}."
+            )
+    return field
 
 
-def extract_triplane_mesh(vae: TriplaneVAE, latent: torch.Tensor, *, resolution: int = 32, threshold: float = 0.5, batch_size: int = 16384, unit_scale: float = 1.0):
+def extract_triplane_mesh(vae: TriplaneVAE, latent: torch.Tensor, *, resolution: int = 32, threshold: float = 0.5, batch_size: int = 16384, unit_scale: float = 1.0, target_mode: str = "occupancy"):
     if latent.dim() == 5 and latent.shape[0] == 1:
         latent = latent[0]
     if latent.dim() == 5 and latent.shape[0] != 1:
         raise ValueError(f"Batch-wise latent decoding is not supported here; expected unbatched [3,H,W,C] or [1,3,H,W,C], got {tuple(latent.shape)}")
-    occ = decode_triplane_batch(vae, latent, resolution=resolution, batch_size=batch_size, device=next(vae.parameters()).device, threshold=threshold)
-    verts, faces, _, _ = measure.marching_cubes(occ, level=threshold)
+    field = decode_triplane_batch(vae, latent, resolution=resolution, batch_size=batch_size, device=next(vae.parameters()).device, threshold=threshold, target_mode=target_mode)
+    verts, faces, _, _ = measure.marching_cubes(field, level=threshold)
     if len(faces) == 0:
-        raise RuntimeError(f"Marching cubes failed to produce faces for threshold={threshold}")
+        mode_label = "threshold" if str(target_mode).lower() == "occupancy" else "level"
+        raise RuntimeError(f"Marching cubes failed to produce faces for {mode_label}={threshold}")
     scale = 2.0 / (resolution - 1)
     verts = verts * scale - 1.0
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)

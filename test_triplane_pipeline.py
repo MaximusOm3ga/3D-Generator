@@ -18,7 +18,7 @@ from triplane_pipeline import (
     make_triplane_schedule,
     save_triplane_latent,
 )
-from vae_model import TriplaneVAE
+from vae_model import TriplaneVAE, vae_loss
 
 
 def _make_sample():
@@ -183,6 +183,31 @@ def test_triplane_vae_rejects_sdf_mode():
         mean = torch.zeros(4, dtype=torch.float32)
         logvar = torch.zeros(4, dtype=torch.float32)
         vae_loss(logits, labels, mean, logvar, target_mode="sdf")
+
+
+
+def test_triplane_udf_decode_uses_level_set_not_sigmoid_threshold():
+    class DummyVAE:
+        def __init__(self):
+            self.decoder = lambda query_points, latent: torch.linalg.norm(query_points, dim=-1) - 0.5
+            self.parameters = lambda: iter([torch.nn.Parameter(torch.zeros(1))])
+
+    latent = torch.zeros(1, 3, 4, 4, 2)
+    field = decode_triplane_batch(DummyVAE(), latent, resolution=8, batch_size=64, device=torch.device('cpu'), threshold=0.0, target_mode='udf')
+    assert field.shape == (8, 8, 8)
+    assert np.isfinite(field).all()
+    assert field.min() < 0.0 < field.max()
+
+
+def test_triplane_vae_udf_loss_is_regression():
+    logits = torch.tensor([0.0, 0.5, 1.0], dtype=torch.float32)
+    labels = torch.tensor([0.1, 0.4, 1.2], dtype=torch.float32)
+    mean = torch.zeros(3, dtype=torch.float32)
+    logvar = torch.zeros(3, dtype=torch.float32)
+    loss, recon, kl = vae_loss(logits, labels, mean, logvar, kl_weight=0.0, target_mode='udf')
+    assert torch.isfinite(loss)
+    assert torch.isfinite(recon)
+    assert float(kl.item()) == pytest.approx(0.0)
 
 
 def test_triplane_decode_rejects_field_without_threshold_crossing():

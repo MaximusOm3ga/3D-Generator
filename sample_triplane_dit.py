@@ -21,6 +21,7 @@ def parse_args():
     p.add_argument("--timesteps", type=int, default=200)
     p.add_argument("--sampling-steps", type=int, default=25)
     p.add_argument("--resolution", type=int, default=32)
+    p.add_argument("--target-mode", type=str, choices=["occupancy", "udf"], default="occupancy")
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -66,7 +67,7 @@ def main():
             seed=args.seed + i,
         )
         z = denormalize_latent(z, stats_mean, stats_std)
-        mesh = extract_triplane_mesh(vae, z, resolution=args.resolution, threshold=args.threshold, batch_size=16384)
+        mesh = extract_triplane_mesh(vae, z, resolution=args.resolution, threshold=args.threshold, batch_size=16384, target_mode=args.target_mode)
         out_path = os.path.join(args.out_dir, f"sample_{i:03d}.obj")
         mesh.export(out_path)
         print(f"Saved {out_path} with {len(mesh.vertices)} vertices and {len(mesh.faces)} faces")
