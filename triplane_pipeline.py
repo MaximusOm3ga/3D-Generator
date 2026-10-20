@@ -18,7 +18,7 @@ DEFAULT_TRIPLANE_CONFIG = {
     "hidden_dim": 128,
     "latent_channels": 8,
     "latent_res": 8,
-    "decoder_hidden_dim": 64,
+    "decoder_hidden_dim": 128,
     "target_mode": "occupancy",
     "field_parameterization": "occupancy",
     "udf_level": 0.0,

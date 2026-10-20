@@ -23,6 +23,8 @@ def parse_args():
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--batch-size", type=int, default=16384)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--n-surface-points", type=int, default=256)
+    p.add_argument("--n-query-points", type=int, default=512)
     return p.parse_args()
 
 
@@ -60,11 +62,21 @@ def main():
         hidden_dim=cfg.get("hidden_dim", 128),
         latent_channels=cfg.get("latent_channels", 8),
         latent_res=cfg.get("latent_res", 8),
+        decoder_hidden_dim=cfg.get("decoder_hidden_dim", 128),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    dataset = SkeletalMeshDataset(cache_dir=args.cache_dir, n_surface_points=256, n_query_points=512, include_occupancy=(args.target_mode == "occupancy"), include_udf=(args.target_mode == "udf"), include_sdf=False, target_mode=args.target_mode)
+    dataset = SkeletalMeshDataset(
+        cache_dir=args.cache_dir,
+        n_surface_points=args.n_surface_points,
+        n_query_points=args.n_query_points,
+        include_occupancy=(args.target_mode == "occupancy"),
+        include_udf=(args.target_mode == "udf"),
+        include_sdf=False,
+        target_mode=args.target_mode,
+    )
+
     sample = dataset[args.object_index]
     metrics = make_sample_metrics(model, sample, device, args.resolution, args.threshold, args.batch_size, args.target_mode)
     os.makedirs(args.out_dir, exist_ok=True)

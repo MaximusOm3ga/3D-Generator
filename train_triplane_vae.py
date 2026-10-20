@@ -95,10 +95,24 @@ def main():
             if args.target_mode == "occupancy":
                 positive_fraction = labels.float().mean().clamp_min(1e-6)
                 pos_weight = ((1.0 - positive_fraction) / positive_fraction).clamp_min(1.0)
-            with torch.autocast(device_type="cuda", enabled=(args.amp and device.type == "cuda")):
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.autocast(
+                    device_type="cuda",
+                    enabled=(args.amp and device.type == "cuda"),
+            ):
                 logits, mean, logvar = model(surface, xyz, query_points)
-                loss, _, _ = vae_loss(logits, labels, mean, logvar, kl_weight=args.kl_weight, pos_weight=pos_weight, target_mode=args.target_mode)
-            optimizer.zero_grad()
+
+                loss, _, _ = vae_loss(
+                    logits,
+                    labels,
+                    mean,
+                    logvar,
+                    kl_weight=args.kl_weight,
+                    pos_weight=pos_weight,
+                    target_mode=args.target_mode,
+                )
+
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -137,7 +151,7 @@ def main():
                 "hidden_dim": args.hidden_dim,
                 "latent_channels": args.latent_channels,
                 "latent_res": args.latent_res,
-                "decoder_hidden_dim": 64,
+                "decoder_hidden_dim": 128,
                 "target_mode": args.target_mode,
                 "preprocessing_version": 3,
             },
