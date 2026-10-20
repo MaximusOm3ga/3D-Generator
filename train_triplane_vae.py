@@ -27,7 +27,7 @@ def parse_args():
     p.add_argument("--latent-channels", type=int, default=DEFAULT_TRIPLANE_CONFIG["latent_channels"])
     p.add_argument("--latent-res", type=int, default=DEFAULT_TRIPLANE_CONFIG["latent_res"])
     p.add_argument("--kl-weight", type=float, default=0.0)
-    p.add_argument("--target-mode", type=str, choices=["occupancy", "sdf"], default="occupancy")
+    p.add_argument("--target-mode", type=str, choices=["occupancy", "udf"], default="occupancy")
     p.add_argument("--amp", action="store_true")
     p.add_argument("--debug-one-object", action="store_true")
     p.add_argument("--debug-object-index", type=int, default=0)
@@ -41,7 +41,8 @@ def build_loader(args):
         n_surface_points=args.n_surface_points,
         n_query_points=args.n_query_points,
         include_occupancy=(args.target_mode == "occupancy"),
-        include_sdf=(args.target_mode == "sdf"),
+        include_udf=(args.target_mode == "udf"),
+        include_sdf=False,
         target_mode=args.target_mode,
     )
     if args.debug_one_object:
@@ -86,7 +87,10 @@ def main():
             surface = batch["surface_points"].to(device)
             xyz = batch["surface_xyz"].to(device)
             query_points = batch["query_points"].to(device)
-            labels = batch["occupancy_labels"].to(device)
+            if args.target_mode == "udf":
+                labels = batch["udf_labels"].to(device)
+            else:
+                labels = batch["occupancy_labels"].to(device)
             pos_weight = None
             if args.target_mode == "occupancy":
                 positive_fraction = labels.float().mean().clamp_min(1e-6)
@@ -107,7 +111,10 @@ def main():
                 surface = batch["surface_points"].to(device)
                 xyz = batch["surface_xyz"].to(device)
                 query_points = batch["query_points"].to(device)
-                labels = batch["occupancy_labels"].to(device)
+                if args.target_mode == "udf":
+                    labels = batch["udf_labels"].to(device)
+                else:
+                    labels = batch["occupancy_labels"].to(device)
                 pos_weight = None
                 if args.target_mode == "occupancy":
                     positive_fraction = labels.float().mean().clamp_min(1e-6)

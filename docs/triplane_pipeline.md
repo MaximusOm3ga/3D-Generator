@@ -4,10 +4,10 @@ This document records the current, validated triplane repair workflow for cached
 
 ## Current status
 
-- The cache/mesh integrity checks are enforced and reject non-watertight or degenerate geometry before occupancy labels are trusted.
+- Geometry and target eligibility are separated: cache validation accepts usable non-watertight meshes for surface/UDF learning while still rejecting invalid geometry or unsupported occupancy labels.
 - The VAE contract has been tightened: `in_channels=54` is required, split metadata is preserved, and latent normalization is channel-wise `[C]` with explicit validation.
-- The remaining real blocker was the occupancy decoder collapsing to a flat low-probability field. This was fixed by using positive-class balancing in the occupancy loss during training. The single-object debug path now trains with sparse occupancy labels without collapsing the logits.
-- The single-object reconstruction check is the required gate before latent encoding or DiT training.
+- Occupancy mode still uses class-balanced BCE to prevent sparse-label collapse. UDF mode is also supported for open or fragmented meshes with a bounded regression target; SDF remains explicitly rejected until a trustworthy signed-distance convention is implemented.
+- The single-object reconstruction check remains the required gate before latent encoding or DiT training.
 
 ## 1) Environment setup
 

@@ -72,7 +72,7 @@ def mesh_quality_report(mesh):
     }
 
 
-def validate_cache_metadata(path):
+def validate_cache_metadata(path, *, require_occupancy=False):
     with np.load(path, allow_pickle=False) as d:
         if int(d.get("preprocessing_version", -1)) != PREPROCESS_VERSION:
             raise ValueError("cache version mismatch")
@@ -95,12 +95,14 @@ def validate_cache_metadata(path):
 
         mesh = trimesh.Trimesh(vertices=v, faces=f, process=False)
         report = mesh_quality_report(mesh)
-        if not report["watertight"]:
-            raise ValueError("cache mesh is not watertight; occupancy labels are not trustworthy")
         if report["degenerate_face_fraction"] > 0.25:
             raise ValueError("mesh contains degenerate faces with near-zero area")
-        if not np.isfinite(report["volume"]) and report["faces"] > 0:
-            raise ValueError("mesh volume is non-finite despite being watertight")
+        if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            raise ValueError("empty mesh")
+        if not np.isfinite(np.asarray(mesh.vertices, dtype=np.float64)).all():
+            raise ValueError("mesh contains non-finite vertices")
+        if require_occupancy and not report["watertight"]:
+            raise ValueError("mesh is not watertight; occupancy labels are not trustworthy")
 
 
 def clean_mesh(mesh):
@@ -322,6 +324,8 @@ def run_modelnet(dataset_root, category="airplane", max_objects=None,
                 print(f"done uid={uid} status=repair_failed", flush=True)
                 continue
             anchors = extract_skeleton_points(mesh)
+            support_targets = np.array(["surface", "udf"], dtype="U32")
+            occupancy_eligible = bool(mesh.is_watertight)
             np.savez(
                 out_path,
                 mesh_vertices=np.asarray(mesh.vertices, dtype=np.float32),
@@ -333,6 +337,8 @@ def run_modelnet(dataset_root, category="airplane", max_objects=None,
                 anchor_sampling=np.array("farthest_point_sampling", dtype="U64"),
                 anchor_count=np.array(N_SKELETON_POINTS, dtype=np.int32),
                 occupancy_method=np.array("validated_mesh_contains", dtype="U64"),
+                occupancy_eligible=np.array(occupancy_eligible, dtype=np.bool_),
+                supported_targets=support_targets,
                 object_id=np.array(uid, dtype="U128"),
                 mesh_vertices_count=np.array(len(mesh.vertices), dtype=np.int32),
                 mesh_faces_count=np.array(len(mesh.faces), dtype=np.int32),

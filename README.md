@@ -125,7 +125,8 @@ python3 sample_dit.py \
 
 The repository explicitly prioritizes correctness over broad experimentation:
 
-- occupancy labels are only trusted when the mesh and query distribution are suitable
+- geometry acceptance and target eligibility are intentionally separate: open or disconnected meshes may still be valid for surface/UDF learning, while occupancy remains gated on watertight, finite geometry
+- occupancy labels are only trusted when the mesh and query distribution are suitable; UDF mode is used for valid non-watertight surface targets
 - cache metadata must match the preprocessing version
 - anchor generation must remain stable across training, validation, and latent encoding
 - latent normalization should be computed from training data only

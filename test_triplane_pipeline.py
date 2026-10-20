@@ -3,7 +3,9 @@ import os
 import numpy as np
 import pytest
 import torch
+import trimesh
 
+from dataset import SkeletalMeshDataset
 from dit_model import TriplaneDiT
 from encode_triplane_latents import compute_channelwise_stats
 from triplane_pipeline import (
@@ -147,9 +149,40 @@ def test_triplane_decoder_chunked_equivalence_small_grid():
     assert torch.allclose(chunked, full, atol=1e-5, rtol=1e-5)
 
 
+def test_triplane_udf_targets_are_nonnegative_and_finite():
+    mesh = trimesh.Trimesh(
+        vertices=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        faces=np.array([[0, 1, 2]], dtype=np.int64),
+        process=False,
+    )
+    ds = SkeletalMeshDataset.__new__(SkeletalMeshDataset)
+    ds.near_surface_std = 0.01
+    ds.target_mode = "udf"
+    ds.include_occupancy = False
+    ds.include_udf = True
+    ds.include_sdf = False
+    ds.sdf_scale = 1.0
+    qpts, udf_vals, mask = ds._sample_udf(mesh, 32, np.random.default_rng(0))
+    assert qpts.shape == (32, 3)
+    assert udf_vals.shape == (32,)
+    assert np.all(np.isfinite(udf_vals))
+    assert np.all(udf_vals >= 0.0)
+    assert np.all(mask == np.concatenate([np.zeros(16, dtype=np.bool_), np.ones(16, dtype=np.bool_)]))
+
+
 def test_triplane_vae_rejects_incompatible_feature_count():
     with pytest.raises(ValueError, match="in_channels=.*54"):
         TriplaneVAE(in_channels=53, hidden_dim=16, latent_channels=2, latent_res=4)
+
+
+def test_triplane_vae_rejects_sdf_mode():
+    with pytest.raises(ValueError, match="not supported"):
+        from vae_model import vae_loss
+        logits = torch.zeros(4, dtype=torch.float32)
+        labels = torch.zeros(4, dtype=torch.float32)
+        mean = torch.zeros(4, dtype=torch.float32)
+        logvar = torch.zeros(4, dtype=torch.float32)
+        vae_loss(logits, labels, mean, logvar, target_mode="sdf")
 
 
 def test_triplane_decode_rejects_field_without_threshold_crossing():

@@ -359,23 +359,28 @@ def vae_loss(
     pos_weight=None,
     target_mode="occupancy",
 ):
+    """Target mode dispatch for occupancy and UDF supervision.
+
+    Occupancy uses class-balanced BCE because sparse surface labels are prone to
+    decoder collapse when background dominates. UDF uses bounded regression on a
+    non-negative distance field. Signed-distance mode remains explicitly rejected
+    because the triplane path does not yet support a trustworthy sign convention.
     """
-    target_mode selects either binary occupancy or signed-distance supervision.
-    When occupancy labels are sparse, auto-balance the positive class so the
-    decoder learns to produce threshold-crossing logits instead of collapsing to a
-    low-probability background mode.
-    """
+    target_mode = str(target_mode).lower()
     if target_mode == "sdf":
-        recon_loss = F.smooth_l1_loss(logits, labels, reduction="mean")
+        raise ValueError("Signed-distance supervision is not supported in this triplane branch; use 'occupancy' or 'udf'.")
+    if target_mode == "udf":
+        recon_loss = F.smooth_l1_loss(logits, labels.float(), reduction="mean")
     else:
+        labels = labels.float()
         if pos_weight is None:
-            positive_fraction = labels.float().mean().clamp_min(1e-6)
+            positive_fraction = labels.mean().clamp_min(1e-6)
             pos_weight = (1.0 - positive_fraction) / positive_fraction
             pos_weight = pos_weight.clamp_min(1.0)
         pos_weight = torch.as_tensor(pos_weight, device=logits.device, dtype=logits.dtype)
         recon_loss = F.binary_cross_entropy_with_logits(
             logits,
-            labels.float(),
+            labels,
             pos_weight=pos_weight,
             reduction="mean",
         )

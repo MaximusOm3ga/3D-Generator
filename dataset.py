@@ -73,6 +73,7 @@ class SkeletalMeshDataset(Dataset):
         include_fourier_features=True,
         fourier_bands=8,
         include_occupancy=True,
+        include_udf=False,
         include_sdf=False,
         target_mode="occupancy",
         sdf_scale=1.0,
@@ -100,8 +101,11 @@ class SkeletalMeshDataset(Dataset):
         self.include_fourier_features = include_fourier_features
         self.fourier_bands = fourier_bands
         self.include_occupancy = include_occupancy
-        self.include_sdf = include_sdf or (str(target_mode).lower() == "sdf")
+        self.include_udf = bool(include_udf) or (str(target_mode).lower() == "udf")
+        self.include_sdf = bool(include_sdf) or (str(target_mode).lower() == "sdf")
         self.target_mode = str(target_mode).lower()
+        if self.target_mode == "sdf":
+            raise ValueError("Signed-distance supervision is not supported in this triplane branch; use 'occupancy' or 'udf'.")
         self.sdf_scale = float(sdf_scale)
         self.seed = int(seed)
         self.deterministic = bool(deterministic)
@@ -152,16 +156,45 @@ class SkeletalMeshDataset(Dataset):
             raise ValueError("degenerate occupancy labels detected; reject this mesh before training")
         return query_points, labels, source_mask
 
-    def _sample_query_targets(self, mesh, n_points, rng=None):
-        query_points, occupancy_labels, source_mask = self._sample_occupancy(mesh, n_points, rng=rng)
-        if self.target_mode == "occupancy":
-            return query_points, occupancy_labels, None, source_mask
+    def _sample_udf(self, mesh, n_points, rng=None):
+        if rng is None:
+            rng = np.random.default_rng()
+        n_uniform = n_points // 2
+        n_near = n_points - n_uniform
 
-        query = trimesh.proximity.ProximityQuery(mesh)
-        signed_distances = np.asarray(query.signed_distance(query_points), dtype=np.float32)
+        uniform_points = rng.uniform(-1.0, 1.0, size=(n_uniform, 3)).astype(np.float32)
+        state = np.random.get_state()
+        try:
+            np.random.seed(int(rng.integers(0, 2**31 - 1)))
+            surface_samples, _ = trimesh.sample.sample_surface(mesh, n_near)
+        finally:
+            np.random.set_state(state)
+        noise = rng.normal(loc=0.0, scale=self.near_surface_std, size=surface_samples.shape).astype(np.float32)
+        near_points = surface_samples + noise
+
+        query_points = np.concatenate([uniform_points, near_points], axis=0).astype(np.float32)
+        source_mask = np.concatenate([
+            np.zeros(n_uniform, dtype=np.bool_),
+            np.ones(n_near, dtype=np.bool_),
+        ])
+        closest_points, distances, _ = mesh.nearest.on_surface(query_points)
+        udf_values = np.linalg.norm(query_points - closest_points, axis=-1).astype(np.float32)
+        if not np.isfinite(udf_values).all():
+            raise ValueError("UDF labels contain NaN/Inf values")
+        if udf_values.min() < 0.0:
+            raise ValueError("UDF labels must be non-negative")
         if self.sdf_scale:
-            signed_distances = signed_distances / self.sdf_scale
-        return query_points, occupancy_labels, signed_distances, source_mask
+            udf_values = np.clip(udf_values / self.sdf_scale, 0.0, 1.0)
+        return query_points, udf_values, source_mask
+
+    def _sample_query_targets(self, mesh, n_points, rng=None):
+        if self.target_mode == "occupancy":
+            query_points, occupancy_labels, source_mask = self._sample_occupancy(mesh, n_points, rng=rng)
+            return query_points, occupancy_labels, None, source_mask
+        if self.target_mode == "udf":
+            query_points, udf_values, source_mask = self._sample_udf(mesh, n_points, rng=rng)
+            return query_points, None, udf_values, source_mask
+        raise ValueError(f"Unsupported target_mode={self.target_mode!r}; expected 'occupancy' or 'udf'.")
 
     def __getitem__(self, idx):
         data = np.load(self.paths[idx])
@@ -183,7 +216,7 @@ class SkeletalMeshDataset(Dataset):
             np.random.set_state(state)
         face_normals = mesh.face_normals[face_idx].astype(np.float32)
         query_points, occupancy_labels, sdf_labels, source_mask = None, None, None, None
-        if self.include_occupancy or self.include_sdf:
+        if self.include_occupancy or self.include_udf or self.include_sdf:
             query_points, occupancy_labels, sdf_labels, source_mask = self._sample_query_targets(
                 mesh, self.n_query_points, rng=rng
             )
@@ -213,10 +246,12 @@ class SkeletalMeshDataset(Dataset):
             "skeleton_points": torch.from_numpy(skeleton_points.astype(np.float32)),
             "sample_seed": int(self.seed + idx),
         }
-        if self.include_occupancy or self.include_sdf:
+        if self.include_occupancy or self.include_udf or self.include_sdf:
             out["query_points"] = torch.from_numpy(query_points)
             if self.include_occupancy:
                 out["occupancy_labels"] = torch.from_numpy(occupancy_labels)
+            if self.include_udf:
+                out["udf_labels"] = torch.from_numpy(sdf_labels)
             if self.include_sdf:
                 out["sdf_labels"] = torch.from_numpy(sdf_labels)
             if source_mask is not None:

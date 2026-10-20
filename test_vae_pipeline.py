@@ -223,7 +223,7 @@ def test_open_mesh_is_rejected_for_occupancy_sampling():
         ds._sample_occupancy(open_mesh, 32, np.random.default_rng(0))
 
 
-def test_validate_cache_metadata_rejects_open_mesh(tmp_path):
+def test_validate_cache_metadata_accepts_open_mesh_for_udf(tmp_path):
     open_mesh = trimesh.Trimesh(
         vertices=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
         faces=np.array([[0, 1, 2]], dtype=np.int64),
@@ -237,8 +237,9 @@ def test_validate_cache_metadata_rejects_open_mesh(tmp_path):
         skeleton_points=np.zeros((256, 3), dtype=np.float32),
         preprocessing_version=np.array(PREPROCESS_VERSION, dtype=np.int32),
     )
+    validate_cache_metadata(str(cache_path))
     with pytest.raises(ValueError, match="watertight|occupancy"):
-        validate_cache_metadata(str(cache_path))
+        validate_cache_metadata(str(cache_path), require_occupancy=True)
 
 
 def test_dense_grid_eval_is_deterministic_for_stochastic_decode_mode():

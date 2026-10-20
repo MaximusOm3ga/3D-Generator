@@ -116,7 +116,7 @@ def main():
         if cache_s["components"] < raw_s["components"]:
             flags.append("COMPONENTS_DROPPED")
         if not cache_s["watertight"]:
-            flags.append("NOT_WATERTIGHT")
+            flags.append("OPEN_MESH")
         if extent_error > 0.20:
             flags.append(f"SHAPE_EXTENT_SHIFT={extent_error:.3f}")
         if unique_skeleton < max(16, int(0.25 * len(skeleton))):
