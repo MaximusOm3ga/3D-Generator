@@ -1,6 +1,7 @@
 
 import os
 import glob
+import warnings
 import numpy as np
 import torch
 import trimesh
@@ -109,6 +110,7 @@ class SkeletalMeshDataset(Dataset):
         self.sdf_scale = float(sdf_scale)
         self.seed = int(seed)
         self.deterministic = bool(deterministic)
+        self.failed_items = set()
 
     def __len__(self):
         return len(self.paths)
@@ -177,7 +179,40 @@ class SkeletalMeshDataset(Dataset):
             np.zeros(n_uniform, dtype=np.bool_),
             np.ones(n_near, dtype=np.bool_),
         ])
-        closest_points, distances, _ = mesh.nearest.on_surface(query_points)
+
+        if not np.isfinite(query_points).all():
+            raise ValueError("UDF query points contain NaN/Inf values")
+
+        def _on_surface_chunked(points: np.ndarray, chunk: int):
+            cp_parts = []
+            dist_parts = []
+            for start in range(0, len(points), chunk):
+                chunk_points = points[start:start + chunk]
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always", RuntimeWarning)
+                    cp, dist, _ = mesh.nearest.on_surface(chunk_points)
+                if any(issubclass(x.category, RuntimeWarning) for x in w):
+                    raise RuntimeError("RuntimeWarning from trimesh nearest-point query")
+                cp = np.asarray(cp, dtype=np.float32)
+                dist = np.asarray(dist, dtype=np.float32)
+                if cp.shape != chunk_points.shape:
+                    raise RuntimeError(f"closest-point shape mismatch: {cp.shape} vs {chunk_points.shape}")
+                if not np.isfinite(cp).all() or not np.isfinite(dist).all():
+                    raise RuntimeError("non-finite nearest-point outputs")
+                cp_parts.append(cp)
+                dist_parts.append(dist)
+            return np.concatenate(cp_parts, axis=0), np.concatenate(dist_parts, axis=0)
+
+        closest_points = None
+        for chunk in (128, 64, 32):
+            try:
+                closest_points, _ = _on_surface_chunked(query_points, chunk)
+                break
+            except Exception:
+                closest_points = None
+        if closest_points is None:
+            raise ValueError("UDF nearest-point query failed across all safe chunk sizes")
+
         udf_values = np.linalg.norm(query_points - closest_points, axis=-1).astype(np.float32)
         if not np.isfinite(udf_values).all():
             raise ValueError("UDF labels contain NaN/Inf values")
@@ -197,66 +232,88 @@ class SkeletalMeshDataset(Dataset):
         raise ValueError(f"Unsupported target_mode={self.target_mode!r}; expected 'occupancy' or 'udf'.")
 
     def __getitem__(self, idx):
-        data = np.load(self.paths[idx])
-        version = int(data.get("preprocessing_version", -1))
-        if version != PREPROCESS_VERSION:
-            raise ValueError(
-                f"Cache version mismatch for {self.paths[idx]}: found {version}, expected {PREPROCESS_VERSION}"
-            )
-        mesh = trimesh.Trimesh(
-            vertices=data["mesh_vertices"], faces=data["mesh_faces"], process=False
-        )
-        rng = self._rng_for_item(idx)
-
-        state = np.random.get_state()
+        if idx in self.failed_items:
+            return None
         try:
-            np.random.seed(int(rng.integers(0, 2**31 - 1)))
-            surface_points, face_idx = trimesh.sample.sample_surface(mesh, self.n_surface_points)
-        finally:
-            np.random.set_state(state)
-        face_normals = mesh.face_normals[face_idx].astype(np.float32)
-        query_points, occupancy_labels, sdf_labels, source_mask = None, None, None, None
-        if self.include_occupancy or self.include_udf or self.include_sdf:
-            query_points, occupancy_labels, sdf_labels, source_mask = self._sample_query_targets(
-                mesh, self.n_query_points, rng=rng
-            )
-        if "skeleton_points" in data:
-            skeleton_points = np.asarray(data["skeleton_points"], dtype=np.float32)
-            if skeleton_points.shape != (256, 3):
+            data = np.load(self.paths[idx])
+            version = int(data.get("preprocessing_version", -1))
+            if version != PREPROCESS_VERSION:
                 raise ValueError(
-                    f"Expected skeleton_points shape (256, 3) in {self.paths[idx]}, got {skeleton_points.shape}"
+                    f"Cache version mismatch for {self.paths[idx]}: found {version}, expected {PREPROCESS_VERSION}"
                 )
-            if not np.isfinite(skeleton_points).all():
-                raise ValueError(f"Non-finite skeleton_points in {self.paths[idx]}")
-        else:
-            skeleton_points = farthest_point_sample(surface_points, n_points=256)
-
-        surface_features = [surface_points.astype(np.float32)]
-        if self.include_normals:
-            surface_features.append(face_normals)
-        if self.include_fourier_features:
-            surface_features.append(
-                _fourier_features(surface_points, num_bands=self.fourier_bands)
+            mesh = trimesh.Trimesh(
+                vertices=data["mesh_vertices"], faces=data["mesh_faces"], process=False
             )
-        surface_features = np.concatenate(surface_features, axis=-1).astype(np.float32)
+            rng = self._rng_for_item(idx)
 
-        out = {
-            "surface_points": torch.from_numpy(surface_features),
-            "surface_xyz": torch.from_numpy(surface_points.astype(np.float32)),
-            "skeleton_points": torch.from_numpy(skeleton_points.astype(np.float32)),
-            "sample_seed": int(self.seed + idx),
-        }
-        if self.include_occupancy or self.include_udf or self.include_sdf:
-            out["query_points"] = torch.from_numpy(query_points)
-            if self.include_occupancy:
-                out["occupancy_labels"] = torch.from_numpy(occupancy_labels)
-            if self.include_udf:
-                out["udf_labels"] = torch.from_numpy(sdf_labels)
-            if self.include_sdf:
-                out["sdf_labels"] = torch.from_numpy(sdf_labels)
-            if source_mask is not None:
-                out["query_source_mask"] = torch.from_numpy(source_mask.astype(np.bool_))
-        return out
+            state = np.random.get_state()
+            try:
+                np.random.seed(int(rng.integers(0, 2**31 - 1)))
+                surface_points, face_idx = trimesh.sample.sample_surface(mesh, self.n_surface_points)
+            finally:
+                np.random.set_state(state)
+            face_normals = mesh.face_normals[face_idx].astype(np.float32)
+
+            query_points, occupancy_labels, sdf_labels, source_mask = None, None, None, None
+            if self.include_occupancy or self.include_udf or self.include_sdf:
+                max_attempts = 4
+                last_exc = None
+                for attempt in range(max_attempts):
+                    try:
+                        query_points, occupancy_labels, sdf_labels, source_mask = self._sample_query_targets(
+                            mesh, self.n_query_points, rng=rng
+                        )
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        if self.target_mode != "udf" or attempt == max_attempts - 1:
+                            raise
+                        continue
+                else:
+                    raise ValueError(f"Failed to sample query targets: {last_exc}")
+
+            if "skeleton_points" in data:
+                skeleton_points = np.asarray(data["skeleton_points"], dtype=np.float32)
+                if skeleton_points.shape != (256, 3):
+                    raise ValueError(
+                        f"Expected skeleton_points shape (256, 3) in {self.paths[idx]}, got {skeleton_points.shape}"
+                    )
+                if not np.isfinite(skeleton_points).all():
+                    raise ValueError(f"Non-finite skeleton_points in {self.paths[idx]}")
+            else:
+                skeleton_points = farthest_point_sample(surface_points, n_points=256)
+
+            surface_features = [surface_points.astype(np.float32)]
+            if self.include_normals:
+                surface_features.append(face_normals)
+            if self.include_fourier_features:
+                surface_features.append(
+                    _fourier_features(surface_points, num_bands=self.fourier_bands)
+                )
+            surface_features = np.concatenate(surface_features, axis=-1).astype(np.float32)
+
+            out = {
+                "surface_points": torch.from_numpy(surface_features),
+                "surface_xyz": torch.from_numpy(surface_points.astype(np.float32)),
+                "skeleton_points": torch.from_numpy(skeleton_points.astype(np.float32)),
+                "sample_seed": int(self.seed + idx),
+            }
+            if self.include_occupancy or self.include_udf or self.include_sdf:
+                out["query_points"] = torch.from_numpy(query_points)
+                if self.include_occupancy:
+                    out["occupancy_labels"] = torch.from_numpy(occupancy_labels)
+                if self.include_udf:
+                    out["udf_labels"] = torch.from_numpy(sdf_labels)
+                if self.include_sdf:
+                    out["sdf_labels"] = torch.from_numpy(sdf_labels)
+                if source_mask is not None:
+                    out["query_source_mask"] = torch.from_numpy(source_mask.astype(np.bool_))
+            return out
+        except Exception:
+            self.failed_items.add(idx)
+            if self.target_mode == "udf":
+                return None
+            raise
 
 
 if __name__ == "__main__":

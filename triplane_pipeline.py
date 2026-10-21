@@ -1,5 +1,6 @@
 import json
 import os
+import warnings
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -235,12 +236,27 @@ def decode_triplane_batch(vae: TriplaneVAE, latent: torch.Tensor, *, resolution:
                 f"Occupancy field does not cross threshold={threshold}; min={float(field.min()):.5f}, max={float(field.max()):.5f}. "
                 "No automatic threshold fallback is allowed."
             )
-    else:
-        if not (float(field.min()) <= threshold <= float(field.max())):
-            raise RuntimeError(
-                f"UDF field does not cross extraction level={threshold}; min={float(field.min()):.5f}, max={float(field.max()):.5f}."
-            )
     return field
+
+
+def _resolve_udf_extraction_level(field: np.ndarray, threshold: float) -> float:
+    field_min = float(field.min())
+    field_max = float(field.max())
+    if field_max <= field_min:
+        raise RuntimeError(f"UDF field is degenerate: min={field_min:.5f}, max={field_max:.5f}")
+    if field_min <= threshold <= field_max:
+        return float(threshold)
+    span = max(field_max - field_min, 1e-6)
+    epsilon = max(1e-6, span * 1e-4)
+    if threshold < field_min:
+        level = field_min + epsilon
+    else:
+        level = field_max - epsilon
+    if level <= field_min:
+        level = field_min + epsilon
+    if level >= field_max:
+        level = field_max - epsilon
+    return float(level)
 
 
 def extract_triplane_mesh(vae: TriplaneVAE, latent: torch.Tensor, *, resolution: int = 32, threshold: float = 0.5, batch_size: int = 16384, unit_scale: float = 1.0, target_mode: str = "occupancy"):
@@ -249,10 +265,18 @@ def extract_triplane_mesh(vae: TriplaneVAE, latent: torch.Tensor, *, resolution:
     if latent.dim() == 5 and latent.shape[0] != 1:
         raise ValueError(f"Batch-wise latent decoding is not supported here; expected unbatched [3,H,W,C] or [1,3,H,W,C], got {tuple(latent.shape)}")
     field = decode_triplane_batch(vae, latent, resolution=resolution, batch_size=batch_size, device=next(vae.parameters()).device, threshold=threshold, target_mode=target_mode)
-    verts, faces, _, _ = measure.marching_cubes(field, level=threshold)
+    level = float(threshold)
+    if str(target_mode).lower() == "udf":
+        level = _resolve_udf_extraction_level(field, float(threshold))
+        if not np.isclose(level, float(threshold), rtol=0.0, atol=1e-6):
+            warnings.warn(
+                f"UDF field does not cross requested level={threshold}; using effective extraction level={level:.6f} "
+                f"(field min={float(field.min()):.6f}, max={float(field.max()):.6f})."
+            )
+    verts, faces, _, _ = measure.marching_cubes(field, level=level)
     if len(faces) == 0:
         mode_label = "threshold" if str(target_mode).lower() == "occupancy" else "level"
-        raise RuntimeError(f"Marching cubes failed to produce faces for {mode_label}={threshold}")
+        raise RuntimeError(f"Marching cubes failed to produce faces for {mode_label}={level}")
     scale = 2.0 / (resolution - 1)
     verts = verts * scale - 1.0
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
