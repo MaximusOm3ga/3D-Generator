@@ -14,6 +14,8 @@ from vae_model import TriplaneVAE, vae_loss
 def parse_args():
     p = argparse.ArgumentParser(description="Train the unconditional triplane VAE on cached airplane meshes.")
     p.add_argument("--cache-dir", type=str, default="cached_objects")
+    p.add_argument("--target-cache-dir", type=str, default="udf_target_cache",
+                   help="Directory for cached query points and occupancy/UDF targets")
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints_triplane")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--epochs", type=int, default=25)
@@ -53,6 +55,7 @@ def build_loader(args):
         include_udf=(args.target_mode == "udf"),
         include_sdf=False,
         target_mode=args.target_mode,
+        target_cache_dir=args.target_cache_dir,
     )
     if args.debug_one_object:
         idx = min(max(args.debug_object_index, 0), len(dataset) - 1)
@@ -72,7 +75,16 @@ def main():
     np.random.seed(args.seed)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     device = torch.device(args.device)
+    print(f"[INIT] Device requested: {device}", flush=True)
+    print("[INIT] Building dataset and data loaders...", flush=True)
+    loader_started = __import__("time").time()
     train_loader, val_loader = build_loader(args)
+    print(
+        f"[INIT] Loaders ready in {__import__('time').time() - loader_started:.1f}s; "
+        f"train_objects={len(train_loader.dataset)}; val_objects={len(val_loader.dataset)}",
+        flush=True,
+    )
+    print("[INIT] Creating model...", flush=True)
     model = TriplaneVAE(
         in_channels=args.in_channels,
         hidden_dim=args.hidden_dim,
@@ -89,6 +101,8 @@ def main():
         start_epoch = ckpt.get("epoch", 0)
 
     for epoch in range(start_epoch, args.epochs):
+        epoch_started = __import__("time").time()
+        print(f"[EPOCH] Starting epoch {epoch + 1}/{args.epochs}", flush=True)
         model.train()
         train_loss = 0.0
         train_steps = 0
@@ -96,6 +110,8 @@ def main():
         for batch_idx, batch in enumerate(train_loader):
             if args.max_batches_per_epoch > 0 and batch_idx >= args.max_batches_per_epoch:
                 break
+            if batch_idx == 0 or (batch_idx + 1) % 10 == 0:
+                print(f"[TRAIN] Epoch {epoch + 1}: batch {batch_idx + 1} received", flush=True)
             if batch is None:
                 skipped_train_batches += 1
                 continue
@@ -133,6 +149,12 @@ def main():
                 optimizer.step()
                 train_loss += loss.item()
                 train_steps += 1
+                if batch_idx == 0 or (batch_idx + 1) % 10 == 0:
+                    print(
+                        f"[TRAIN] Epoch {epoch + 1}, batch {batch_idx + 1} done; "
+                        f"loss={loss.item():.5f}",
+                        flush=True,
+                    )
                 if device.type == "cuda":
                     del surface, xyz, query_points, labels, logits, mean, logvar, loss
                     torch.cuda.empty_cache()
@@ -185,7 +207,13 @@ def main():
                     raise
         train_loss /= max(train_steps, 1)
         val_loss /= max(val_steps, 1)
-        print(f"epoch={epoch + 1}/{args.epochs} train_loss={train_loss:.5f} val_loss={val_loss:.5f} skipped_train_batches={skipped_train_batches} skipped_val_batches={skipped_val_batches}")
+        print(
+            f"epoch={epoch + 1}/{args.epochs} train_loss={train_loss:.5f} "
+            f"val_loss={val_loss:.5f} skipped_train_batches={skipped_train_batches} "
+            f"skipped_val_batches={skipped_val_batches} "
+            f"epoch_time={__import__('time').time() - epoch_started:.1f}s",
+            flush=True,
+        )
         payload = {
             "epoch": epoch + 1,
             "model_state": model.state_dict(),
