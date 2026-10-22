@@ -301,6 +301,8 @@ def run_modelnet(dataset_root, category="airplane", max_objects=None,
                  split="train", output_dir=OUTPUT_DIR):
     os.makedirs(output_dir, exist_ok=True)
     paths = resolve_modelnet_paths(dataset_root, category, split)
+    if max_objects is not None:
+        paths = paths[:max(0, int(max_objects))]
     kept = skipped = 0
     reasons = {"repair_failed": 0, "exception": 0}
     for path in paths:

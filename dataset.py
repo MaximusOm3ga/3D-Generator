@@ -1,6 +1,8 @@
 
 import os
 import glob
+import hashlib
+import time
 import warnings
 import numpy as np
 import torch
@@ -80,16 +82,33 @@ class SkeletalMeshDataset(Dataset):
         sdf_scale=1.0,
         seed=42,
         deterministic=True,
+        target_cache_dir="udf_target_cache",
     ):
+        self.target_cache_dir = os.path.abspath(target_cache_dir)
+        os.makedirs(self.target_cache_dir, exist_ok=True)
         self.paths = sorted(glob.glob(os.path.join(cache_dir, "*.npz")))
+        total_cache_paths = len(self.paths)
+        print(f"[DATA] Found {total_cache_paths} cache files; validating metadata...", flush=True)
+        validation_started = time.time()
         valid_paths = []
-        for path in self.paths:
+        for i, path in enumerate(self.paths, start=1):
             try:
                 validate_cache_metadata(path)
                 valid_paths.append(path)
             except Exception as exc:
-                print(f"Skipping incompatible cache {path}: {exc}")
+                print(f"Skipping incompatible cache {path}: {exc}", flush=True)
+            if i % 25 == 0 or i == len(self.paths):
+                print(
+                    f"[DATA] Validated {i}/{len(self.paths)}; valid={len(valid_paths)}; "
+                    f"elapsed={time.time() - validation_started:.1f}s",
+                    flush=True,
+                )
         self.paths = valid_paths
+        print(
+            f"[DATA] Cache validation finished: {len(self.paths)}/{total_cache_paths} valid "
+            f"in {time.time() - validation_started:.1f}s",
+            flush=True,
+        )
 
         if len(self.paths) == 0:
             raise RuntimeError(
@@ -114,6 +133,19 @@ class SkeletalMeshDataset(Dataset):
 
     def __len__(self):
         return len(self.paths)
+
+    def _target_cache_path(self, idx):
+        key = "|".join([
+            os.path.basename(self.paths[idx]),
+            self.target_mode,
+            str(self.n_query_points),
+            str(self.near_surface_std),
+            str(self.sdf_scale),
+            str(self.seed + int(idx)),
+            str(PREPROCESS_VERSION),
+        ])
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return os.path.join(self.target_cache_dir, f"{digest}.npz")
 
     def _rng_for_item(self, idx):
         if not self.deterministic:
@@ -235,6 +267,9 @@ class SkeletalMeshDataset(Dataset):
         if idx in self.failed_items:
             return None
         try:
+            item_started = time.time()
+            if idx % 25 == 0:
+                print(f"[DATA] Loading object {idx + 1}/{len(self.paths)}", flush=True)
             data = np.load(self.paths[idx])
             version = int(data.get("preprocessing_version", -1))
             if version != PREPROCESS_VERSION:
@@ -256,21 +291,70 @@ class SkeletalMeshDataset(Dataset):
 
             query_points, occupancy_labels, sdf_labels, source_mask = None, None, None, None
             if self.include_occupancy or self.include_udf or self.include_sdf:
-                max_attempts = 4
-                last_exc = None
-                for attempt in range(max_attempts):
+                target_path = self._target_cache_path(idx)
+                cache_loaded = False
+                if os.path.exists(target_path):
                     try:
-                        query_points, occupancy_labels, sdf_labels, source_mask = self._sample_query_targets(
-                            mesh, self.n_query_points, rng=rng
-                        )
-                        break
+                        with np.load(target_path, allow_pickle=False) as cached:
+                            query_points = np.asarray(cached["query_points"], dtype=np.float32)
+                            source_mask = np.asarray(cached["source_mask"], dtype=np.bool_)
+                            if self.include_occupancy:
+                                occupancy_labels = np.asarray(cached["occupancy_labels"], dtype=np.float32)
+                            if self.include_udf or self.include_sdf:
+                                sdf_labels = np.asarray(cached["udf_labels"], dtype=np.float32)
+                        if (
+                            query_points.shape != (self.n_query_points, 3)
+                            or source_mask.shape != (self.n_query_points,)
+                            or not np.isfinite(query_points).all()
+                        ):
+                            raise ValueError("invalid cached target shapes or values")
+                        if self.include_occupancy and (
+                            occupancy_labels.shape != (self.n_query_points,)
+                            or not np.isfinite(occupancy_labels).all()
+                        ):
+                            raise ValueError("invalid cached occupancy labels")
+                        if (self.include_udf or self.include_sdf) and (
+                            sdf_labels.shape != (self.n_query_points,)
+                            or not np.isfinite(sdf_labels).all()
+                            or np.any(sdf_labels < 0.0)
+                        ):
+                            raise ValueError("invalid cached UDF labels")
+                        cache_loaded = True
+                        print(f"[TARGET CACHE] HIT {idx + 1}/{len(self.paths)}", flush=True)
                     except Exception as exc:
-                        last_exc = exc
-                        if self.target_mode != "udf" or attempt == max_attempts - 1:
-                            raise
-                        continue
-                else:
-                    raise ValueError(f"Failed to sample query targets: {last_exc}")
+                        print(f"[TARGET CACHE] Invalid cache for object {idx + 1}; regenerating: {exc}", flush=True)
+                if not cache_loaded:
+                    target_started = time.time()
+                    max_attempts = 4
+                    last_exc = None
+                    for attempt in range(max_attempts):
+                        try:
+                            query_points, occupancy_labels, sdf_labels, source_mask = self._sample_query_targets(
+                                mesh, self.n_query_points, rng=rng
+                            )
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                            if self.target_mode != "udf" or attempt == max_attempts - 1:
+                                raise
+                    else:
+                        raise ValueError(f"Failed to sample query targets: {last_exc}")
+                    print(
+                        f"[DATA] Object {idx + 1}: query targets ready in {time.time() - target_started:.2f}s",
+                        flush=True,
+                    )
+                    tmp_path = f"{target_path}.{os.getpid()}.tmp.npz"
+                    cache_values = {
+                        "query_points": query_points.astype(np.float32),
+                        "source_mask": source_mask.astype(np.bool_),
+                    }
+                    if occupancy_labels is not None:
+                        cache_values["occupancy_labels"] = occupancy_labels.astype(np.float32)
+                    if sdf_labels is not None:
+                        cache_values["udf_labels"] = sdf_labels.astype(np.float32)
+                    np.savez_compressed(tmp_path, **cache_values)
+                    os.replace(tmp_path, target_path)
+                    print(f"[TARGET CACHE] CREATED {idx + 1}/{len(self.paths)}", flush=True)
 
             if "skeleton_points" in data:
                 skeleton_points = np.asarray(data["skeleton_points"], dtype=np.float32)
@@ -308,6 +392,8 @@ class SkeletalMeshDataset(Dataset):
                     out["sdf_labels"] = torch.from_numpy(sdf_labels)
                 if source_mask is not None:
                     out["query_source_mask"] = torch.from_numpy(source_mask.astype(np.bool_))
+            if idx % 25 == 0:
+                print(f"[DATA] Object {idx + 1} ready in {time.time() - item_started:.2f}s", flush=True)
             return out
         except Exception:
             self.failed_items.add(idx)
