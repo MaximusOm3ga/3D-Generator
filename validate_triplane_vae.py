@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Diagnose a trained triplane VAE by encoding and decoding one cached mesh.
+
+This is a reconstruction/extraction diagnostic, not a training script. It writes
+both the source mesh and reconstruction plus a JSON report. Defaults are chosen
+for a 4 GiB GPU; lower --batch-size or use --device cpu if needed.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+import torch
+import trimesh
+from skimage import measure
+
+from dataset import SkeletalMeshDataset
+from triplane_pipeline import (
+    _resolve_udf_extraction_level,
+    decode_triplane_batch,
+    save_json,
+)
+from vae_model import TriplaneVAE
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Diagnose VAE reconstruction quality and mesh extraction."
+    )
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--cache-dir", default="cached_objects")
+    parser.add_argument("--target-cache-dir", default="udf_target_cache")
+    parser.add_argument("--out-dir", default="vae_diagnostics")
+    parser.add_argument("--object-index", type=int, default=0)
+    parser.add_argument("--resolution", type=int, default=64)
+    parser.add_argument("--target-mode", choices=("occupancy", "udf"), default="udf")
+    parser.add_argument("--threshold", type=float, default=0.02,
+                        help="Occupancy probability threshold, or UDF isosurface level.")
+    parser.add_argument("--batch-size", type=int, default=512,
+                        help="Number of grid/query points decoded per GPU chunk.")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--n-surface-points", type=int, default=256)
+    parser.add_argument("--n-query-points", type=int, default=512)
+    return parser.parse_args()
+
+
+def mesh_summary(mesh):
+    """Return size and connected-component metrics without modifying the mesh."""
+    components = mesh.split(only_watertight=False)
+    component_sizes = sorted((int(len(part.faces)) for part in components), reverse=True)
+    bounds = np.asarray(mesh.bounds, dtype=np.float64) if len(mesh.vertices) else np.zeros((2, 3))
+    return {
+        "vertices": int(len(mesh.vertices)),
+        "faces": int(len(mesh.faces)),
+        "watertight": bool(mesh.is_watertight),
+        "component_count": int(len(components)),
+        "component_face_counts_top10": component_sizes[:10],
+        "bounds": bounds.tolist(),
+        "extents": (bounds[1] - bounds[0]).tolist(),
+        "surface_area": float(mesh.area) if len(mesh.faces) else 0.0,
+        "volume": float(mesh.volume) if mesh.is_watertight else None,
+    }
+
+
+def load_model(checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if "model_state" not in checkpoint:
+        raise ValueError("Checkpoint is missing 'model_state'. Use a triplane VAE checkpoint.")
+    config = checkpoint.get("model_config") or checkpoint.get("args") or {}
+    model = TriplaneVAE(
+        in_channels=int(config.get("in_channels", 54)),
+        hidden_dim=int(config.get("hidden_dim", 128)),
+        latent_channels=int(config.get("latent_channels", 8)),
+        latent_res=int(config.get("latent_res", 8)),
+        decoder_hidden_dim=int(config.get("decoder_hidden_dim", 128)),
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+    return model, checkpoint, config
+
+
+def predict_points(model, latent, points, device, batch_size):
+    predictions = []
+    with torch.inference_mode():
+        for start in range(0, len(points), batch_size):
+            chunk = torch.as_tensor(
+                points[start:start + batch_size], dtype=torch.float32, device=device
+            ).unsqueeze(0)
+            pred = model.decoder(chunk, latent).reshape(-1).detach().cpu().numpy()
+            predictions.append(pred)
+    return np.concatenate(predictions) if predictions else np.zeros(0, dtype=np.float32)
+
+
+def extract_mesh_from_field(field, threshold, target_mode):
+    field_min, field_max = float(np.min(field)), float(np.max(field))
+    if not np.isfinite(field).all():
+        raise RuntimeError("Decoded field contains NaN or Inf.")
+    if field_min == field_max:
+        raise RuntimeError(f"Decoded field is constant: {field_min:.6g}.")
+    requested_level = float(threshold)
+    if target_mode == "occupancy":
+        if not field_min < requested_level < field_max:
+            raise RuntimeError(
+                f"Occupancy field does not cross threshold {requested_level:.6g}; "
+                f"min={field_min:.6g}, max={field_max:.6g}."
+            )
+        effective_level = requested_level
+    else:
+        effective_level = _resolve_udf_extraction_level(field, requested_level)
+
+    vertices, faces, _, _ = measure.marching_cubes(field, level=effective_level)
+    vertices = vertices * (2.0 / (field.shape[0] - 1)) - 1.0
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    return mesh, {
+        "field_min": field_min,
+        "field_max": field_max,
+        "field_mean": float(np.mean(field)),
+        "field_std": float(np.std(field)),
+        "requested_level": requested_level,
+        "effective_level": float(effective_level),
+        "level_was_adjusted": not np.isclose(
+            requested_level, effective_level, rtol=0.0, atol=1e-6
+        ),
+    }
+
+
+def main():
+    args = parse_args()
+    if args.resolution < 8:
+        raise ValueError("--resolution must be at least 8.")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be positive.")
+    device = torch.device(args.device)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    model, checkpoint, config = load_model(args.checkpoint, device)
+    checkpoint_mode = config.get("target_mode")
+    if checkpoint_mode and checkpoint_mode != args.target_mode:
+        print(
+            f"[WARN] Checkpoint target_mode={checkpoint_mode!r}, but requested "
+            f"target_mode={args.target_mode!r}. Confirm these match training."
+        )
+
+    dataset = SkeletalMeshDataset(
+        cache_dir=args.cache_dir,
+        target_cache_dir=args.target_cache_dir,
+        n_surface_points=args.n_surface_points,
+        n_query_points=args.n_query_points,
+        include_occupancy=args.target_mode == "occupancy",
+        include_udf=args.target_mode == "udf",
+        include_sdf=False,
+        target_mode=args.target_mode,
+    )
+    if not 0 <= args.object_index < len(dataset):
+        raise IndexError(
+            f"--object-index {args.object_index} is outside dataset range "
+            f"0..{len(dataset) - 1}."
+        )
+    sample = dataset[args.object_index]
+    if sample is None:
+        raise RuntimeError(f"Dataset failed to load object index {args.object_index}.")
+
+    source_path = dataset.paths[args.object_index]
+    with np.load(source_path, allow_pickle=False) as cached:
+        source_mesh = trimesh.Trimesh(
+            vertices=np.asarray(cached["mesh_vertices"], dtype=np.float32),
+            faces=np.asarray(cached["mesh_faces"], dtype=np.int64),
+            process=False,
+        )
+    source_mesh.export(out_dir / "source_mesh.obj")
+
+    surface = sample["surface_points"].to(device).unsqueeze(0)
+    xyz = sample["surface_xyz"].to(device).unsqueeze(0)
+    with torch.inference_mode():
+        latent_mean, latent_logvar = model.encode(surface, xyz)
+        latent = latent_mean
+    del surface, xyz
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    print(
+        f"[INFO] Decoding {args.resolution}^3 grid in chunks of {args.batch_size} "
+        f"on {device}; this may take time.",
+        flush=True,
+    )
+    field = decode_triplane_batch(
+        model, latent, resolution=args.resolution, batch_size=args.batch_size,
+        device=device, threshold=args.threshold, target_mode=args.target_mode,
+    )
+    reconstructed_mesh, field_metrics = extract_mesh_from_field(
+        field, args.threshold, args.target_mode
+    )
+    reconstructed_mesh.export(out_dir / "reconstruction.obj")
+
+    metrics = {
+        "source_mesh": mesh_summary(source_mesh),
+        "reconstruction_mesh": mesh_summary(reconstructed_mesh),
+        "decoded_field": field_metrics,
+        "latent": {
+            "shape": list(latent.shape),
+            "mean": float(latent.mean().item()),
+            "std": float(latent.std().item()),
+            "min": float(latent.min().item()),
+            "max": float(latent.max().item()),
+            "finite": bool(torch.isfinite(latent).all().item()),
+            "posterior_logvar_mean": float(latent_logvar.mean().item()),
+        },
+    }
+
+    query_key = "udf_labels" if args.target_mode == "udf" else "occupancy_labels"
+    if "query_points" in sample and query_key in sample:
+        query_points = sample["query_points"].cpu().numpy()
+        prediction = predict_points(model, latent, query_points, device, args.batch_size)
+        target = sample[query_key].cpu().numpy().astype(np.float32)
+        error = prediction - target
+        metrics["sampled_target_fit"] = {
+            "target_key": query_key,
+            "mae": float(np.mean(np.abs(error))),
+            "rmse": float(np.sqrt(np.mean(error ** 2))),
+            "prediction_min": float(prediction.min()),
+            "prediction_max": float(prediction.max()),
+            "target_min": float(target.min()),
+            "target_max": float(target.max()),
+        }
+        if args.target_mode == "udf" and "query_source_mask" in sample:
+            mask = sample["query_source_mask"].cpu().numpy().astype(bool)
+            if mask.any():
+                metrics["sampled_target_fit"]["near_surface_mae"] = float(
+                    np.mean(np.abs(error[mask]))
+                )
+                metrics["sampled_target_fit"]["near_surface_rmse"] = float(
+                    np.sqrt(np.mean(error[mask] ** 2))
+                )
+
+    source_components = metrics["source_mesh"]["component_count"]
+    recon_components = metrics["reconstruction_mesh"]["component_count"]
+    metrics["diagnostic_flags"] = {
+        "reconstruction_is_empty": len(reconstructed_mesh.faces) == 0,
+        "reconstruction_has_many_components": recon_components > 10,
+        "source_has_many_components": source_components > 10,
+        "warning": (
+            "This script reports geometry and field diagnostics; it does not "
+            "declare a reconstruction good solely from vertex/face counts."
+        ),
+    }
+    report = {
+        "checkpoint": str(args.checkpoint),
+        "checkpoint_epoch": checkpoint.get("epoch"),
+        "checkpoint_target_mode": checkpoint_mode,
+        "object_index": args.object_index,
+        "source_cache_file": os.path.basename(source_path),
+        "device": str(device),
+        "resolution": args.resolution,
+        "batch_size": args.batch_size,
+        "target_mode": args.target_mode,
+        "metrics": metrics,
+    }
+    save_json(str(out_dir / "report.json"), report)
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
