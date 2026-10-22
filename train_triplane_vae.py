@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 
 import numpy as np
 import torch
@@ -77,10 +78,10 @@ def main():
     device = torch.device(args.device)
     print(f"[INIT] Device requested: {device}", flush=True)
     print("[INIT] Building dataset and data loaders...", flush=True)
-    loader_started = __import__("time").time()
+    loader_started = time.time()
     train_loader, val_loader = build_loader(args)
     print(
-        f"[INIT] Loaders ready in {__import__('time').time() - loader_started:.1f}s; "
+        f"[INIT] Loaders ready in {time.time() - loader_started:.1f}s; "
         f"train_objects={len(train_loader.dataset)}; val_objects={len(val_loader.dataset)}",
         flush=True,
     )
@@ -101,7 +102,7 @@ def main():
         start_epoch = ckpt.get("epoch", 0)
 
     for epoch in range(start_epoch, args.epochs):
-        epoch_started = __import__("time").time()
+        epoch_started = time.time()
         print(f"[EPOCH] Starting epoch {epoch + 1}/{args.epochs}", flush=True)
         model.train()
         train_loss = 0.0
@@ -211,7 +212,7 @@ def main():
             f"epoch={epoch + 1}/{args.epochs} train_loss={train_loss:.5f} "
             f"val_loss={val_loss:.5f} skipped_train_batches={skipped_train_batches} "
             f"skipped_val_batches={skipped_val_batches} "
-            f"epoch_time={__import__('time').time() - epoch_started:.1f}s",
+            f"epoch_time={time.time() - epoch_started:.1f}s",
             flush=True,
         )
         payload = {
