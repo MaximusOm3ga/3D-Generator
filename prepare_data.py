@@ -30,7 +30,7 @@ def _degenerate_face_threshold(mesh):
         return 1e-12
 
 
-def mesh_quality_report(mesh):
+def mesh_quality_report(mesh, compute_components = True):
     if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
         raise ValueError("mesh is empty")
 
