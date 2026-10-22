@@ -87,7 +87,8 @@ class SkeletalMeshDataset(Dataset):
         self.target_cache_dir = os.path.abspath(target_cache_dir)
         os.makedirs(self.target_cache_dir, exist_ok=True)
         self.paths = sorted(glob.glob(os.path.join(cache_dir, "*.npz")))
-        print(f"[DATA] Found {len(self.paths)} cache files; validating metadata...", flush=True)
+        total_cache_paths = len(self.paths)
+        print(f"[DATA] Found {total_cache_paths} cache files; validating metadata...", flush=True)
         validation_started = time.time()
         valid_paths = []
         for i, path in enumerate(self.paths, start=1):
@@ -104,7 +105,7 @@ class SkeletalMeshDataset(Dataset):
                 )
         self.paths = valid_paths
         print(
-            f"[DATA] Cache validation finished: {len(self.paths)}/{len(self.paths) + 0} valid "
+            f"[DATA] Cache validation finished: {len(self.paths)}/{total_cache_paths} valid "
             f"in {time.time() - validation_started:.1f}s",
             flush=True,
         )
