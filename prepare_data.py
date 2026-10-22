@@ -53,13 +53,18 @@ def mesh_quality_report(mesh):
     finite_areas = areas[np.isfinite(areas)]
     degenerate_threshold = max(1e-12, np.median(finite_areas) * 1e-8) if finite_areas.size else 1e-12
     degenerate_fraction = float((areas <= degenerate_threshold).sum() / max(len(areas), 1)) if len(areas) else 0.0
-    components = mesh.split(only_watertight=False)
-    component_face_sizes = [int(len(part.faces)) for part in components]
+    if compute_components:
+        components = mesh.split(only_watertight=False)
+        component_face_sizes = [int(len(part.faces)) for part in components]
+        component_count = len(components)
+    else:
+        component_face_sizes = []
+        component_count = None
 
     return {
         "vertices": int(len(vertices)),
         "faces": int(len(faces)),
-        "components": int(len(components)),
+        "components": component_count,
         "component_face_sizes": component_face_sizes,
         "watertight": bool(mesh.is_watertight),
         "orientation_consistent": bool(mesh.is_watertight),
@@ -94,7 +99,7 @@ def validate_cache_metadata(path, *, require_occupancy=False):
             raise ValueError("invalid skeleton_points")
 
         mesh = trimesh.Trimesh(vertices=v, faces=f, process=False)
-        report = mesh_quality_report(mesh)
+        report = mesh_quality_report(mesh, compute_components=False)
         if report["degenerate_face_fraction"] > 0.25:
             raise ValueError("mesh contains degenerate faces with near-zero area")
         if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
