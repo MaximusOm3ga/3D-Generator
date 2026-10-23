@@ -30,6 +30,8 @@ def parse_args():
     p.add_argument("--latent-channels", type=int, default=DEFAULT_TRIPLANE_CONFIG["latent_channels"])
     p.add_argument("--latent-res", type=int, default=DEFAULT_TRIPLANE_CONFIG["latent_res"])
     p.add_argument("--kl-weight", type=float, default=0.0)
+    p.add_argument("--udf-near-weight", type=float, default=4.0,
+                   help="Relative weight for near-surface UDF samples (query_source_mask).")
     p.add_argument("--target-mode", type=str, choices=["occupancy", "udf"], default="occupancy")
     p.add_argument("--amp", action="store_true")
     p.add_argument("--debug-one-object", action="store_true")
@@ -144,6 +146,8 @@ def main():
                         kl_weight=args.kl_weight,
                         pos_weight=pos_weight,
                         target_mode=args.target_mode,
+                        udf_mask=(batch["query_source_mask"].to(device) if args.target_mode == "udf" and "query_source_mask" in batch else None),
+                        udf_near_weight=args.udf_near_weight,
                     )
 
                 loss.backward()
@@ -192,7 +196,13 @@ def main():
                         positive_fraction = labels.float().mean().clamp_min(1e-6)
                         pos_weight = ((1.0 - positive_fraction) / positive_fraction).clamp_min(1.0)
                     logits, mean, logvar = model(surface, xyz, query_points)
-                    loss, _, _ = vae_loss(logits, labels, mean, logvar, kl_weight=args.kl_weight, pos_weight=pos_weight, target_mode=args.target_mode)
+                    loss, _, _ = vae_loss(
+                        logits, labels, mean, logvar,
+                        kl_weight=args.kl_weight, pos_weight=pos_weight,
+                        target_mode=args.target_mode,
+                        udf_mask=(batch["query_source_mask"].to(device) if args.target_mode == "udf" and "query_source_mask" in batch else None),
+                        udf_near_weight=args.udf_near_weight,
+                    )
                     val_loss += loss.item()
                     val_steps += 1
                     if device.type == "cuda":
