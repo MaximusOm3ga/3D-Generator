@@ -345,8 +345,10 @@ class TriplaneVAE(nn.Module):
 
     def forward(self, surface_features, surface_xyz, query_points):
         mean, logvar = self.encoder.encode(surface_features, surface_xyz)
-        z = self.encoder.reparameterize(mean, logvar)
-        occupancy_logits = self.decoder(query_points, z)
+        # Train the decoder on the exact posterior-mean representation exported to
+        # the latent cache and consumed by the DiT. Sampling here creates a train /
+        # encode mismatch: validation and encode_triplane_latents.py decode mean.
+        occupancy_logits = self.decoder(query_points, mean)
         return occupancy_logits, mean, logvar
 
 
@@ -358,6 +360,8 @@ def vae_loss(
     kl_weight=1e-4,
     pos_weight=None,
     target_mode="occupancy",
+    udf_mask=None,
+    udf_near_weight=4.0,
 ):
     """Target mode dispatch for occupancy and UDF supervision.
 
@@ -370,7 +374,19 @@ def vae_loss(
     if target_mode == "sdf":
         raise ValueError("Signed-distance supervision is not supported in this triplane branch; use 'occupancy' or 'udf'.")
     if target_mode == "udf":
-        recon_loss = F.smooth_l1_loss(logits, labels.float(), reduction="mean")
+        # Uniform-space points teach the far field; near-surface points determine
+        # where marching cubes extracts the airplane. Upweight the latter.
+        per_point_loss = F.smooth_l1_loss(logits, labels.float(), reduction="none")
+        if udf_mask is not None:
+            weights = torch.ones_like(per_point_loss)
+            weights = torch.where(
+                udf_mask.to(device=logits.device, dtype=torch.bool),
+                torch.full_like(per_point_loss, float(udf_near_weight)),
+                weights,
+            )
+            recon_loss = (per_point_loss * weights).sum() / weights.sum().clamp_min(1.0)
+        else:
+            recon_loss = per_point_loss.mean()
     else:
         labels = labels.float()
         if pos_weight is None:
