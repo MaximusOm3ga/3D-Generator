@@ -147,24 +147,53 @@ def test_reverse_diffusion_timestep_order_is_high_to_low_and_finite():
     assert torch.isfinite(sampled).all()
 
 
-def test_ddpm_sampling_stays_finite_with_reduced_schedule():
+def test_ddpm_rejects_reduced_step_schedule():
     class DummyDiT(torch.nn.Module):
         def forward(self, z_noisy, timesteps, clip_tokens=None, dino_tokens=None):
             return torch.randn_like(z_noisy)
 
-    betas, alphas, alphas_cumprod = make_schedule(20, device="cpu")
+    _betas, alphas, alphas_cumprod = make_schedule(20, device="cpu")
+    with pytest.raises(ValueError, match="DDPM requires"):
+        sample_latent(
+            DummyDiT(),
+            shape=(2, 4, 3),
+            alphas=alphas,
+            alphas_cumprod=alphas_cumprod,
+            timesteps=20,
+            sampling_steps=8,
+            device="cpu",
+            sampler="ddpm",
+        )
+
+
+def test_ddpm_sampling_stays_finite_with_full_schedule():
+    class DummyDiT(torch.nn.Module):
+        def forward(self, z_noisy, timesteps, clip_tokens=None, dino_tokens=None):
+            return torch.randn_like(z_noisy)
+
+    _betas, alphas, alphas_cumprod = make_schedule(20, device="cpu")
     sampled = sample_latent(
         DummyDiT(),
         shape=(2, 4, 3),
         alphas=alphas,
         alphas_cumprod=alphas_cumprod,
         timesteps=20,
-        sampling_steps=8,
+        sampling_steps=20,
         device="cpu",
         sampler="ddpm",
     )
     assert torch.isfinite(sampled).all()
     assert sampled.shape == (2, 4, 3)
+
+
+def test_mesh_decode_rejects_invalid_resolution_and_threshold():
+    class DummyVAE:
+        decoder = lambda self, grid, latent: torch.zeros((grid.shape[0], grid.shape[1]))
+
+    with pytest.raises(ValueError, match="resolution"):
+        decode_to_mesh(DummyVAE(), torch.zeros(1, 1, 4), "cpu", resolution=1)
+    with pytest.raises(ValueError, match="threshold"):
+        decode_to_mesh(DummyVAE(), torch.zeros(1, 1, 4), "cpu", resolution=8, threshold=1.0)
 
 
 def test_dense_grid_eval_and_mesh_scaling_in_range():
