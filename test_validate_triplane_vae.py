@@ -3,7 +3,7 @@ import pytest
 import torch
 import trimesh
 
-from validate_triplane_vae import extract_mesh_from_field, mesh_summary
+from validate_triplane_vae import extract_mesh_from_field, field_fit_metrics, mesh_summary
 
 
 def test_mesh_summary_reports_disconnected_components():
@@ -32,3 +32,23 @@ def test_occupancy_extraction_rejects_threshold_not_crossed():
     field = np.full((8, 8, 8), 0.25, dtype=np.float32)
     with pytest.raises(RuntimeError, match="constant"):
         extract_mesh_from_field(field, threshold=0.5, target_mode="occupancy")
+
+
+
+def test_dense_grid_field_fit_metrics_separates_near_surface_error():
+    target = np.full((4, 4, 4), 0.2, dtype=np.float32)
+    target[0, :, :] = 0.01
+    prediction = target.copy()
+    prediction[0, :, :] += 0.02
+    prediction[1:, :, :] += 0.01
+
+    metrics = field_fit_metrics(prediction, target, near_band=0.05)
+
+    assert metrics["near_surface_point_count"] == 16
+    assert metrics["near_surface_mae"] == pytest.approx(0.02, abs=1e-6)
+    assert metrics["mae"] == pytest.approx((16 * 0.02 + 48 * 0.01) / 64, abs=1e-6)
+
+
+def test_dense_grid_field_fit_rejects_shape_mismatch():
+    with pytest.raises(ValueError, match="shape mismatch"):
+        field_fit_metrics(np.zeros((4, 4, 4)), np.zeros((3, 3, 3)))

@@ -24,7 +24,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--n-surface-points", type=int, default=256)
-    p.add_argument("--n-query-points", type=int, default=512)
+    p.add_argument("--n-query-points", type=int, default=2048)
     p.add_argument("--in-channels", type=int, default=DEFAULT_TRIPLANE_CONFIG["in_channels"])
     p.add_argument("--hidden-dim", type=int, default=DEFAULT_TRIPLANE_CONFIG["hidden_dim"])
     p.add_argument("--latent-channels", type=int, default=DEFAULT_TRIPLANE_CONFIG["latent_channels"])

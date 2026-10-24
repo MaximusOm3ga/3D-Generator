@@ -76,14 +76,16 @@ def main():
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
+    # Latent export only needs surface points and XYZ anchors. Do not generate
+    # occupancy/UDF query labels here: that work is unused and can dominate runtime.
     dataset = SkeletalMeshDataset(
         cache_dir=args.cache_dir,
         n_surface_points=256,
-        n_query_points=512,
-        include_occupancy=(args.target_mode == "occupancy"),
-        include_udf=(args.target_mode == "udf"),
+        n_query_points=0,
+        include_occupancy=False,
+        include_udf=False,
         include_sdf=False,
-        target_mode=args.target_mode,
+        target_mode="occupancy",
     )
     chosen_paths = pick_data_paths(dataset, args.split)
     train_latents = []

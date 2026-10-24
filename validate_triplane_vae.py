@@ -35,13 +35,19 @@ def parse_args():
     parser.add_argument("--object-index", type=int, default=0)
     parser.add_argument("--resolution", type=int, default=64)
     parser.add_argument("--target-mode", choices=("occupancy", "udf"), default="udf")
-    parser.add_argument("--threshold", type=float, default=0.02,
+    parser.add_argument("--threshold", type=float, default=0.01,
                         help="Occupancy probability threshold, or UDF isosurface level.")
     parser.add_argument("--batch-size", type=int, default=512,
                         help="Number of grid/query points decoded per GPU chunk.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--n-surface-points", type=int, default=256)
-    parser.add_argument("--n-query-points", type=int, default=512)
+    parser.add_argument("--n-query-points", type=int, default=2048)
+    parser.add_argument("--udf-near-band", type=float, default=0.05,
+                        help="Distance cutoff for dense-grid near-surface error metrics.")
+    parser.add_argument("--reference-chunk-size", type=int, default=4096,
+                        help="CPU points per nearest-surface query for dense reference UDF.")
+    parser.add_argument("--threshold-sweep", type=str, default="0.005,0.01,0.02,0.03",
+                        help="Comma-separated UDF extraction levels to compare.")
     return parser.parse_args()
 
 
@@ -125,12 +131,52 @@ def extract_mesh_from_field(field, threshold, target_mode):
     }
 
 
+def dense_reference_udf(mesh, resolution, chunk_size, scale=1.0):
+    """Evaluate normalized unsigned distance to the cached mesh on the decoder grid."""
+    if chunk_size < 1:
+        raise ValueError("--reference-chunk-size must be positive.")
+    coords = np.linspace(-1.0, 1.0, resolution, dtype=np.float32)
+    grid = np.stack(np.meshgrid(coords, coords, coords, indexing="ij"), axis=-1).reshape(-1, 3)
+    values = np.empty(len(grid), dtype=np.float32)
+    for start in range(0, len(grid), chunk_size):
+        points = grid[start:start + chunk_size]
+        closest, _, _ = mesh.nearest.on_surface(points)
+        dist = np.linalg.norm(points - np.asarray(closest, dtype=np.float32), axis=-1)
+        values[start:start + len(points)] = np.clip(dist / max(float(scale), 1e-8), 0.0, 1.0)
+    return values.reshape(resolution, resolution, resolution)
+
+
+def field_fit_metrics(prediction, target, near_band=0.05):
+    """Compare decoded and reference UDF on identical dense-grid coordinates."""
+    prediction = np.asarray(prediction, dtype=np.float32)
+    target = np.asarray(target, dtype=np.float32)
+    if prediction.shape != target.shape:
+        raise ValueError(f"Predicted/reference grid shape mismatch: {prediction.shape} != {target.shape}")
+    if not np.isfinite(prediction).all() or not np.isfinite(target).all():
+        raise ValueError("Dense UDF grids contain NaN or Inf.")
+    error = prediction - target
+    near = target <= float(near_band)
+    result = {
+        "mae": float(np.mean(np.abs(error))),
+        "rmse": float(np.sqrt(np.mean(error ** 2))),
+        "reference_near_band": float(near_band),
+        "near_surface_point_count": int(near.sum()),
+        "near_surface_fraction": float(near.mean()),
+    }
+    if near.any():
+        result["near_surface_mae"] = float(np.mean(np.abs(error[near])))
+        result["near_surface_rmse"] = float(np.sqrt(np.mean(error[near] ** 2)))
+    return result
+
+
 def main():
     args = parse_args()
     if args.resolution < 8:
         raise ValueError("--resolution must be at least 8.")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be positive.")
+    if args.udf_near_band <= 0:
+        raise ValueError("--udf-near-band must be positive.")
     device = torch.device(args.device)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -194,10 +240,37 @@ def main():
     )
     reconstructed_mesh.export(out_dir / "reconstruction.obj")
 
+    threshold_sweep = {}
+    if args.target_mode == "udf":
+        try:
+            levels = sorted({float(value.strip()) for value in args.threshold_sweep.split(",") if value.strip()})
+            for level in levels:
+                if level <= 0:
+                    raise ValueError("UDF threshold sweep levels must be positive.")
+                candidate, candidate_info = extract_mesh_from_field(field, level, "udf")
+                candidate.export(out_dir / f"reconstruction_udf_{level:g}.obj")
+                threshold_sweep[str(level)] = {
+                    "mesh": mesh_summary(candidate),
+                    "field": candidate_info,
+                }
+        except Exception as exc:
+            threshold_sweep["error"] = str(exc)
+
+    dense_grid_fit = None
+    if args.target_mode == "udf":
+        print("[INFO] Computing exact reference UDF on the same dense grid (CPU nearest-surface queries)...", flush=True)
+        reference_field = dense_reference_udf(
+            source_mesh, args.resolution, args.reference_chunk_size, scale=1.0
+        )
+        dense_grid_fit = field_fit_metrics(field, reference_field, args.udf_near_band)
+        del reference_field
+
     metrics = {
         "source_mesh": mesh_summary(source_mesh),
         "reconstruction_mesh": mesh_summary(reconstructed_mesh),
         "decoded_field": field_metrics,
+        "dense_grid_fit": dense_grid_fit,
+        "threshold_sweep": threshold_sweep,
         "latent": {
             "shape": list(latent.shape),
             "mean": float(latent.mean().item()),
