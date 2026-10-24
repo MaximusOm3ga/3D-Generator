@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument("--target-cache-dir", default="udf_target_cache")
     parser.add_argument("--out-dir", default="vae_diagnostics")
     parser.add_argument("--object-index", type=int, default=0)
-    parser.add_argument("--resolution", type=int, default=96)
+    parser.add_argument("--resolution", type=int, default=64)
     parser.add_argument("--target-mode", choices=("occupancy", "udf"), default="udf")
     parser.add_argument("--threshold", type=float, default=0.01,
                         help="Occupancy probability threshold, or UDF isosurface level.")
