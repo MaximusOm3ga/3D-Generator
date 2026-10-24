@@ -308,7 +308,9 @@ class TriplaneDecoder(nn.Module):
         combined = torch.cat([xy_feat, yz_feat, xz_feat], dim=-1)
         pos = self.pos_embed(query_points)
         udf_prediction = self.mlp(torch.cat([combined, pos], dim=-1)).squeeze(-1)
-        return udf_prediction
+        # UDF is non-negative by definition. Softplus prevents negative
+        # distances from creating unintended zero-level crossings.
+        return F.softplus(udf_prediction)
 
 
 class TriplaneVAE(nn.Module):
