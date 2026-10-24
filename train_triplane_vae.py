@@ -29,7 +29,12 @@ def parse_args():
     p.add_argument("--hidden-dim", type=int, default=DEFAULT_TRIPLANE_CONFIG["hidden_dim"])
     p.add_argument("--latent-channels", type=int, default=DEFAULT_TRIPLANE_CONFIG["latent_channels"])
     p.add_argument("--latent-res", type=int, default=DEFAULT_TRIPLANE_CONFIG["latent_res"])
-    p.add_argument("--kl-weight", type=float, default=0.0)
+    p.add_argument("--decoder-hidden-dim", type=int, default=256,
+                   help="Hidden width for the higher-capacity triplane decoder.")
+    p.add_argument("--kl-weight", type=float, default=1e-5,
+                   help="Non-zero KL regularization; tune only after comparing reconstruction and KL scales.")
+    p.add_argument("--udf-near-band", type=float, default=0.05,
+                   help="Reference UDF distance at or below which query loss is upweighted.")
     p.add_argument("--udf-near-weight", type=float, default=4.0,
                    help="Relative weight for near-surface UDF samples (query_source_mask).")
     p.add_argument("--target-mode", type=str, choices=["occupancy", "udf"], default="occupancy")
@@ -93,6 +98,7 @@ def main():
         hidden_dim=args.hidden_dim,
         latent_channels=args.latent_channels,
         latent_res=args.latent_res,
+        decoder_hidden_dim=args.decoder_hidden_dim,
     ).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     best_val = float("inf")
@@ -148,6 +154,7 @@ def main():
                         target_mode=args.target_mode,
                         udf_mask=(batch["query_source_mask"].to(device) if args.target_mode == "udf" and "query_source_mask" in batch else None),
                         udf_near_weight=args.udf_near_weight,
+                        udf_near_band=args.udf_near_band,
                     )
 
                 loss.backward()
@@ -202,6 +209,7 @@ def main():
                         target_mode=args.target_mode,
                         udf_mask=(batch["query_source_mask"].to(device) if args.target_mode == "udf" and "query_source_mask" in batch else None),
                         udf_near_weight=args.udf_near_weight,
+                        udf_near_band=args.udf_near_band,
                     )
                     val_loss += loss.item()
                     val_steps += 1
@@ -236,7 +244,7 @@ def main():
                 "hidden_dim": args.hidden_dim,
                 "latent_channels": args.latent_channels,
                 "latent_res": args.latent_res,
-                "decoder_hidden_dim": 128,
+                "decoder_hidden_dim": args.decoder_hidden_dim,
                 "target_mode": args.target_mode,
                 "preprocessing_version": 3,
             },
