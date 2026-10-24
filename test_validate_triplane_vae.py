@@ -30,5 +30,5 @@ def test_udf_extraction_reports_adjusted_level():
 
 def test_occupancy_extraction_rejects_threshold_not_crossed():
     field = np.full((8, 8, 8), 0.25, dtype=np.float32)
-    with pytest.raises(RuntimeError, match="does not cross threshold"):
+    with pytest.raises(RuntimeError, match="constant"):
         extract_mesh_from_field(field, threshold=0.5, target_mode="occupancy")
