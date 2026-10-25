@@ -130,6 +130,7 @@ class SkeletalMeshDataset(Dataset):
         self.seed = int(seed)
         self.deterministic = bool(deterministic)
         self.failed_items = set()
+        self._access_counts = {}
 
     def __len__(self):
         return len(self.paths)
@@ -150,7 +151,12 @@ class SkeletalMeshDataset(Dataset):
     def _rng_for_item(self, idx):
         if not self.deterministic:
             return np.random.default_rng()
-        return np.random.default_rng(self.seed + max(int(idx), 0))
+        # Deterministic across runs, but changes the selected subset on each
+        # access so the model sees different points from the cached pools.
+        count = self._access_counts.get(int(idx), 0)
+        self._access_counts[int(idx)] = count + 1
+        seed = self.seed + max(int(idx), 0) + count * 1000003
+        return np.random.default_rng(seed)
 
     def _sample_occupancy(self, mesh, n_points, rng=None):
         if rng is None:
