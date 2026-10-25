@@ -1,148 +1,99 @@
-# 3D Generator
+# Conditional3D: class-conditioned 3D point-cloud diffusion
 
-This repository implements a VAE-to-DiT 3D generation pipeline aimed at single-object airplane reconstruction and generation. The long-term project goal is to stabilize the implicit-field pipeline:
+This repository now has two compartments:
 
-mesh -> surface/query labels -> VAE -> latent cache -> DiT -> decoded field -> mesh extraction
+- `legacy/`: the previous triplane VAE/UDF + DiT experiments, preserved at their prior contents.
+- `conditional3d/`: a new end-to-end, GPU-trainable class-conditional 3D generation pipeline.
 
-## Current status
+The new model is an intentionally smaller, original baseline—not TRELLIS and not a reproduction of TRELLIS. It learns a distribution over normalized surface point clouds and conditions generation on dataset categories. It supports arbitrary mesh datasets with category folders, including ModelNet40's `.off` files. The output can be saved as a point cloud and optionally reconstructed as a triangle mesh using Open3D Poisson reconstruction (or a convex-hull fallback).
 
-The repository has improved substantially in reliability and reproducibility, including:
+## Important scope and limitations
 
-- deterministic preprocessing and cache validation
-- farthest-point anchor generation checks
-- checkpoint compatibility guards
-- dense-grid VAE diagnostics
-- latent version and normalization metadata checks
-- corrected reverse-diffusion ordering for DDIM-style sampling
-- improved tests for sampling and cache integrity
+This is a practical baseline designed to get an end-to-end training/inference loop running on a Kaggle GPU. It is **not** a 500K-scale model out of the box, does not perform text-conditioned generation, and does not promise TRELLIS-level mesh quality. The first successful target is class-conditioned generation (for example, chair, airplane, lamp, table) over the classes present in the training data. Train on a subset first, inspect samples, then scale up.
 
-However, this is still a research pipeline, not a claim of fully solved 3D generation. The critical remaining requirement is to prove that the VAE reconstructs a coherent airplane mesh before trusting DiT generation results.
+The model uses a DDPM objective over point coordinates, a transformer denoiser, timestep embeddings, class embeddings, and classifier-free condition dropout. Mesh reconstruction is a postprocessing stage and may be imperfect; point-cloud outputs are the model's native output.
 
-Use the project as a controlled single-class airplane pipeline, not as a broad multi-category generation system.
+## Quick start (Kaggle)
 
-## Project structure
+1. Add/download a mesh dataset to the Kaggle notebook, or attach ModelNet40 as a Kaggle dataset. Mesh files must be arranged under category directories, for example `/kaggle/input/modelnet40/airplane/train/*.off`.
+2. Enable a GPU accelerator.
+3. Clone this repository, or use the repository files already in the notebook.
 
-- `prepare_data.py` — repair/normalize cached meshes and validate preprocessing metadata
-- `dataset.py` — object dataset, query sampling, occupancy labels, and anchor handling
-- `train_vae.py` — VAE training, validation, dense-grid diagnostics, and reconstruction checks
-- `vae_model.py` — VAE architecture and occupancy objective logic
-- `encode_latents.py` — encode VAE posterior means into latent caches
-- `latent_dataset.py` — latent cache loading, validation, and normalization helpers
-- `train_dit.py` — DiT training loop and checkpointing
-- `dit_model.py` — latent diffusion model
-- `sample_dit.py` — reverse diffusion and mesh export
-- `check_vae_now.py` — quick single-checkpoint VAE inspection
-- `test_vae_pipeline.py` — regression tests covering key reliability paths
-
-## Typical workflow
-
-### 1. Prepare the airplane cache
+Install dependencies:
 
 ```bash
-python3 prepare_data.py \
-  --source modelnet \
-  --dataset-root /home/th3suarez/Downloads/archive/ModelNet40 \
-  --category airplane \
-  --split train
+pip install -r requirements.txt
 ```
 
-### 2. Train the VAE
+Prepare normalized surface samples. The script recursively scans supported mesh files and uses the first directory below the dataset root as the category by default. Adjust `--category-depth` for another layout.
 
 ```bash
-python3 train_vae.py \
-  --cache-dir cached_objects \
-  --checkpoint-dir checkpoints \
-  --epochs 200 \
-  --batch-size 1 \
-  --n-surface-points 4096 \
-  --n-query-points 2048 \
-  --accum-steps 1 \
-  --check-every 10 \
-  --seed 42
+python -m conditional3d.prepare_dataset \
+  --input-root /kaggle/input/modelnet40 \
+  --output /kaggle/working/modelnet40_points.npz \
+  --points 512 \
+  --max-objects 0
 ```
 
-For a single-object debug/reconstruction pass:
+`--max-objects 0` means no cap. For a first smoke test, use `--max-objects 256`; do not start with the entire dataset until preprocessing and one training epoch have been verified. Dataset preprocessing can take a while because meshes are loaded and sampled individually.
+
+Train:
 
 ```bash
-python3 train_vae.py \
-  --cache-dir cached_objects \
-  --checkpoint-dir checkpoints \
-  --epochs 1 \
-  --batch-size 1 \
-  --n-surface-points 512 \
-  --n-query-points 256 \
-  --accum-steps 1 \
-  --check-every 1 \
-  --debug-one-object \
-  --debug-object-index 0 \
-  --kl-weight 0.0 \
-  --kl-warmup-epochs 1
+python -m conditional3d.train \
+  --data /kaggle/working/modelnet40_points.npz \
+  --output-dir /kaggle/working/conditional3d_runs/modelnet40 \
+  --epochs 100 \
+  --batch-size 16 \
+  --points 512 \
+  --width 256 \
+  --depth 6 \
+  --heads 8 \
+  --device cuda
 ```
 
-### 3. Inspect a trained VAE checkpoint
+For a T4/limited-memory GPU, start with `--points 256 --width 128 --depth 4 --heads 4 --batch-size 8`. The point count, model dimensions, and dataset size materially affect VRAM and runtime.
+
+Generate objects from a learned category:
 
 ```bash
-python3 check_vae_now.py \
-  --vae-ckpt checkpoints/vae_best.pt \
-  --cache-dir cached_objects \
-  --resolution 48
-```
-
-### 4. Encode the latent cache
-
-```bash
-python3 encode_latents.py \
-  --vae-ckpt checkpoints/vae_best.pt \
-  --out-dir cached_latents
-```
-
-### 5. Train the DiT
-
-```bash
-python3 train_dit.py \
-  --latent-dir cached_latents \
-  --condition-dir conditions \
-  --split train \
-  --batch-size 1 \
-  --checkpoint-every-steps 100
-```
-
-### 6. Sample generated meshes
-
-```bash
-python3 sample_dit.py \
-  --dit-ckpt checkpoints/dit_last.pt \
-  --vae-ckpt checkpoints/vae_best.pt \
-  --out-dir samples \
+python -m conditional3d.sample \
+  --checkpoint /kaggle/working/conditional3d_runs/modelnet40/best.pt \
+  --class-name chair \
   --num-samples 4 \
-  --cfg-scale 1.0 \
-  --resolution 128 \
-  --threshold 0.3 \
-  --decode-batch-points 32768
+  --output-dir /kaggle/working/generated \
+  --steps 100 \
+  --mesh
 ```
 
-## Reliability and correctness notes
+The exact category names are written to `classes.json` in the run directory and embedded in the checkpoint. Use a name present in that file. `--mesh` tries Open3D Poisson reconstruction; if Open3D is unavailable or reconstruction fails, a convex-hull mesh fallback is used and a warning is printed. The point cloud `.ply` is the faithful model output; treat reconstructed meshes as approximate geometry.
 
-The repository explicitly prioritizes correctness over broad experimentation:
-
-- geometry acceptance and target eligibility are intentionally separate: open or disconnected meshes may still be valid for surface/UDF learning, while occupancy remains gated on watertight, finite geometry
-- occupancy labels are only trusted when the mesh and query distribution are suitable; UDF mode is used for valid non-watertight surface targets
-- cache metadata must match the preprocessing version
-- anchor generation must remain stable across training, validation, and latent encoding
-- latent normalization should be computed from training data only
-- reverse-diffusion steps must progress from high noise to low noise
-- VAE reconstruction quality should be validated on a single airplane before DiT training is considered meaningful
-
-## Validation
-
-The project includes a focused regression suite:
+## Resume training
 
 ```bash
-pytest -q
+python -m conditional3d.train \
+  --data /kaggle/working/modelnet40_points.npz \
+  --output-dir /kaggle/working/conditional3d_runs/modelnet40 \
+  --resume /kaggle/working/conditional3d_runs/modelnet40/last.pt \
+  --epochs 100 --device cuda
 ```
 
-Current status of the test suite: green under the present environment.
+The checkpoint includes model, optimizer, epoch, best validation loss, configuration, and class mapping. Save `/kaggle/working` artifacts to Kaggle output or persistent storage before the session ends.
 
-## Important caveat
+## Dataset formats
 
-This project is not yet a proven end-to-end generation system. The main requirement before treating the pipeline as stable is to demonstrate that the VAE reconstructs a coherent airplane mesh from a fixed, trusted object. Until that single-object reconstruction passes inspection, broader DiT generation should be treated as exploratory rather than reliable.
+- ModelNet40: category/train/test directory layout with OFF meshes.
+- Other mesh datasets: supported files include OBJ, PLY, STL, OFF, GLB/GLTF, and other formats supported by trimesh. Place each category in its own directory.
+- Category labels are derived from directory names. The loader does not infer semantic labels from filenames or captions.
+
+For larger datasets, use a manifest and shard preprocessing rather than attempting to keep all source meshes in RAM. The prepared NPZ is a single array; ensure enough disk space for `N × points × 3 × 4` bytes plus overhead.
+
+## Tests
+
+Run lightweight tests (no GPU or dataset required):
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests cover normalization, model output shape, diffusion loss, and checkpoint-independent sampling mechanics. They do not prove learned generation quality; that requires a real training run and inspection of exported samples.
