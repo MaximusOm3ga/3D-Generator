@@ -20,6 +20,7 @@ from dataset import SkeletalMeshDataset
 from triplane_pipeline import (
     _resolve_udf_extraction_level,
     decode_triplane_batch,
+    extract_udf_mesh_from_field,
     save_json,
 )
 from vae_model import TriplaneVAE
@@ -119,9 +120,12 @@ def extract_mesh_from_field(field, threshold, target_mode):
     else:
         effective_level = _resolve_udf_extraction_level(field, requested_level)
 
-    vertices, faces, _, _ = measure.marching_cubes(field, level=effective_level)
-    vertices = vertices * (2.0 / (field.shape[0] - 1)) - 1.0
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    if target_mode == "udf":
+        mesh = extract_udf_mesh_from_field(field, effective_level)
+    else:
+        vertices, faces, _, _ = measure.marching_cubes(field, level=effective_level)
+        vertices = vertices * (2.0 / (field.shape[0] - 1)) - 1.0
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     return mesh, {
         "field_min": field_min,
         "field_max": field_max,
