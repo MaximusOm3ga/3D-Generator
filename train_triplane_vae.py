@@ -23,12 +23,16 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--n-surface-points", type=int, default=256)
+    p.add_argument("--n-surface-points", type=int, default=2048)
     p.add_argument("--n-query-points", type=int, default=2048)
     p.add_argument("--in-channels", type=int, default=DEFAULT_TRIPLANE_CONFIG["in_channels"])
     p.add_argument("--hidden-dim", type=int, default=DEFAULT_TRIPLANE_CONFIG["hidden_dim"])
     p.add_argument("--latent-channels", type=int, default=DEFAULT_TRIPLANE_CONFIG["latent_channels"])
     p.add_argument("--latent-res", type=int, default=DEFAULT_TRIPLANE_CONFIG["latent_res"])
+    p.add_argument("--decoder-plane-resolution", type=int, default=32, help="Learned feature-plane resolution after upsampling compact latents.")
+    p.add_argument("--udf-scale", type=float, default=0.05)
+    p.add_argument("--initial-udf", type=float, default=0.01)
+    p.add_argument("--udf-surface-weight", type=float, default=4.0)
     p.add_argument("--decoder-hidden-dim", type=int, default=256,
                    help="Hidden width for the higher-capacity triplane decoder.")
     p.add_argument("--kl-weight", type=float, default=1e-5,
@@ -99,6 +103,9 @@ def main():
         latent_channels=args.latent_channels,
         latent_res=args.latent_res,
         decoder_hidden_dim=args.decoder_hidden_dim,
+        decoder_plane_resolution=args.decoder_plane_resolution,
+        udf_scale=args.udf_scale,
+        initial_udf=args.initial_udf,
     ).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     best_val = float("inf")
@@ -143,6 +150,7 @@ def main():
                         enabled=(args.amp and device.type == "cuda"),
                 ):
                     logits, mean, logvar = model(surface, xyz, query_points)
+                    pred_surface_udf = model.decoder(xyz, mean) if args.target_mode == "udf" else None
 
                     loss, _, _ = vae_loss(
                         logits,
@@ -155,6 +163,8 @@ def main():
                         udf_mask=(batch["query_source_mask"].to(device) if args.target_mode == "udf" and "query_source_mask" in batch else None),
                         udf_near_weight=args.udf_near_weight,
                         udf_near_band=args.udf_near_band,
+                        pred_surface_udf=pred_surface_udf,
+                        udf_surface_weight=args.udf_surface_weight,
                     )
 
                 loss.backward()
@@ -203,6 +213,7 @@ def main():
                         positive_fraction = labels.float().mean().clamp_min(1e-6)
                         pos_weight = ((1.0 - positive_fraction) / positive_fraction).clamp_min(1.0)
                     logits, mean, logvar = model(surface, xyz, query_points)
+                    pred_surface_udf = model.decoder(xyz, mean) if args.target_mode == "udf" else None
                     loss, _, _ = vae_loss(
                         logits, labels, mean, logvar,
                         kl_weight=args.kl_weight, pos_weight=pos_weight,
@@ -210,6 +221,8 @@ def main():
                         udf_mask=(batch["query_source_mask"].to(device) if args.target_mode == "udf" and "query_source_mask" in batch else None),
                         udf_near_weight=args.udf_near_weight,
                         udf_near_band=args.udf_near_band,
+                        pred_surface_udf=pred_surface_udf,
+                        udf_surface_weight=args.udf_surface_weight,
                     )
                     val_loss += loss.item()
                     val_steps += 1
@@ -245,6 +258,10 @@ def main():
                 "latent_channels": args.latent_channels,
                 "latent_res": args.latent_res,
                 "decoder_hidden_dim": args.decoder_hidden_dim,
+                "decoder_plane_resolution": args.decoder_plane_resolution,
+                "udf_scale": args.udf_scale,
+                "initial_udf": args.initial_udf,
+                "udf_surface_weight": args.udf_surface_weight,
                 "target_mode": args.target_mode,
                 "preprocessing_version": 3,
             },
