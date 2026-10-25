@@ -80,6 +80,9 @@ def load_model(checkpoint_path, device):
         latent_channels=int(config.get("latent_channels", 8)),
         latent_res=int(config.get("latent_res", 8)),
         decoder_hidden_dim=int(config.get("decoder_hidden_dim", 128)),
+        decoder_plane_resolution=int(config.get("decoder_plane_resolution", 32)),
+        udf_scale=float(config.get("udf_scale", 0.05)),
+        initial_udf=float(config.get("initial_udf", 0.01)),
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()

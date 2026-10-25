@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import math
 
 
 class PointEmbed(nn.Module):
@@ -261,15 +262,30 @@ class TriplaneLatentVAE(nn.Module):
 
 
 class TriplaneDecoder(nn.Module):
+    """Decode compact latent planes into higher-resolution spatial features."""
 
-
-    def __init__(self, latent_channels=16, embed_dim=128, hidden_dim=128):
+    def __init__(self, latent_channels=16, embed_dim=128, hidden_dim=128,
+                 plane_resolution=32, udf_scale=0.05, initial_udf=0.01):
         super().__init__()
         self.latent_channels = int(latent_channels)
         self.embed_dim = int(embed_dim)
+        self.plane_resolution = int(plane_resolution)
+        self.udf_scale = float(udf_scale)
+        if self.udf_scale <= 0 or initial_udf <= 0 or initial_udf >= self.udf_scale * 20:
+            raise ValueError("Require udf_scale > 0 and a reasonable positive initial_udf.")
+        self.plane_decoder = nn.Sequential(
+            nn.Conv2d(latent_channels, latent_channels * 4, 3, padding=1),
+            nn.GELU(),
+            nn.Upsample(size=(16, 16), mode="bilinear", align_corners=True),
+            nn.Conv2d(latent_channels * 4, latent_channels * 2, 3, padding=1),
+            nn.GELU(),
+            nn.Upsample(size=(plane_resolution, plane_resolution), mode="bilinear", align_corners=True),
+            nn.Conv2d(latent_channels * 2, latent_channels, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(latent_channels, latent_channels, 3, padding=1),
+            nn.GELU(),
+        )
         self.pos_embed = PointEmbed(out_dim=embed_dim)
-        # Keep each plane's evidence separate until the decoder can learn
-        # how XY, YZ and XZ jointly describe thin structures.
         self.mlp = nn.Sequential(
             nn.Linear(3 * latent_channels + embed_dim, hidden_dim),
             nn.GELU(),
@@ -279,38 +295,40 @@ class TriplaneDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+        # Start near the surface rather than at softplus(0) ~= 0.693.
+        nn.init.constant_(self.mlp[-1].bias, math.log(math.expm1(initial_udf / self.udf_scale)))
 
     def _sample_plane(self, plane_img, coords_2d):
-                                                                   
-        grid = coords_2d.unsqueeze(2)                                                
-        sampled = torch.nn.functional.grid_sample(
+        grid = coords_2d.unsqueeze(2)
+        sampled = F.grid_sample(
             plane_img, grid, mode="bilinear", padding_mode="border", align_corners=True
-        )                
-        return sampled.squeeze(-1).transpose(1, 2)             
+        )
+        return sampled.squeeze(-1).transpose(1, 2)
 
     def forward(self, query_points, triplane_latent):
         if query_points.dim() != 3 or query_points.shape[-1] != 3:
             raise ValueError(f"Expected query_points shape [B,N,3], got {tuple(query_points.shape)}")
-        if triplane_latent.dim() != 5:
-            raise ValueError(f"Expected triplane latent shape [B,3,H,W,C], got {tuple(triplane_latent.shape)}")
-        if triplane_latent.shape[1] != 3:
-            raise ValueError(f"Expected 3 plane tensors, got shape {tuple(triplane_latent.shape)}")
-
-        xy_img = triplane_latent[:, 0].permute(0, 3, 1, 2)
-        yz_img = triplane_latent[:, 1].permute(0, 3, 1, 2)
-        xz_img = triplane_latent[:, 2].permute(0, 3, 1, 2)
-
+        if triplane_latent.dim() != 5 or triplane_latent.shape[1] != 3:
+            raise ValueError(f"Expected triplane latent [B,3,H,W,C], got {tuple(triplane_latent.shape)}")
+        if not torch.isfinite(query_points).all():
+            raise ValueError("Query coordinates contain NaN or Inf.")
+        if torch.any(query_points < -1.0001) or torch.any(query_points > 1.0001):
+            raise ValueError("Query coordinates must be normalized to [-1, 1].")
+        b, _, h, w, channels = triplane_latent.shape
+        if channels != self.latent_channels:
+            raise ValueError(f"Expected {self.latent_channels} latent channels, got {channels}")
+        planes = triplane_latent.permute(0, 1, 4, 2, 3).reshape(b * 3, channels, h, w)
+        planes = self.plane_decoder(planes).reshape(
+            b, 3, channels, self.plane_resolution, self.plane_resolution
+        )
+        xy_img, yz_img, xz_img = planes[:, 0], planes[:, 1], planes[:, 2]
         xy_feat = self._sample_plane(xy_img, query_points[:, :, [0, 1]])
         yz_feat = self._sample_plane(yz_img, query_points[:, :, [1, 2]])
         xz_feat = self._sample_plane(xz_img, query_points[:, :, [0, 2]])
-
-        # Concatenation avoids collapsing plane-specific signals by summation.
         combined = torch.cat([xy_feat, yz_feat, xz_feat], dim=-1)
         pos = self.pos_embed(query_points)
-        udf_prediction = self.mlp(torch.cat([combined, pos], dim=-1)).squeeze(-1)
-        # UDF is non-negative by definition. Softplus prevents negative
-        # distances from creating unintended zero-level crossings.
-        return F.softplus(udf_prediction)
+        raw = self.mlp(torch.cat([combined, pos], dim=-1)).squeeze(-1)
+        return self.udf_scale * F.softplus(raw)
 
 
 class TriplaneVAE(nn.Module):
@@ -322,6 +340,9 @@ class TriplaneVAE(nn.Module):
         latent_channels=16,
         latent_res=32,
         decoder_hidden_dim=128,
+        decoder_plane_resolution=32,
+        udf_scale=0.05,
+        initial_udf=0.01,
     ):
         super().__init__()
         expected_in_channels = 3 + 3 + 48
@@ -341,7 +362,8 @@ class TriplaneVAE(nn.Module):
             latent_res=latent_res,
         )
         self.decoder = TriplaneDecoder(
-            latent_channels=latent_channels, hidden_dim=decoder_hidden_dim
+            latent_channels=latent_channels, hidden_dim=decoder_hidden_dim,
+            plane_resolution=decoder_plane_resolution, udf_scale=udf_scale, initial_udf=initial_udf
         )
 
     def encode(self, surface_features, surface_xyz):
@@ -370,6 +392,8 @@ def vae_loss(
     udf_mask=None,
     udf_near_weight=4.0,
     udf_near_band=0.05,
+    pred_surface_udf=None,
+    udf_surface_weight=4.0,
 ):
     """Target mode dispatch for occupancy and UDF supervision.
 
@@ -396,6 +420,8 @@ def vae_loss(
             torch.ones_like(per_point_loss),
         )
         recon_loss = (per_point_loss * weights).sum() / weights.sum().clamp_min(1.0)
+        if pred_surface_udf is not None:
+            recon_loss = recon_loss + float(udf_surface_weight) * pred_surface_udf.abs().mean()
     else:
         labels = labels.float()
         if pos_weight is None:
