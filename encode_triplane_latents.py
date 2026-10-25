@@ -73,6 +73,9 @@ def main():
         latent_channels=cfg.get("latent_channels", 8),
         latent_res=cfg.get("latent_res", 8),
         decoder_hidden_dim=cfg.get("decoder_hidden_dim", 128),
+        decoder_plane_resolution=cfg.get("decoder_plane_resolution", 32),
+        udf_scale=cfg.get("udf_scale", 0.05),
+        initial_udf=cfg.get("initial_udf", 0.01),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
