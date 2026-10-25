@@ -12,6 +12,7 @@ from triplane_pipeline import (
     DEFAULT_TRIPLANE_CONFIG,
     decode_triplane_batch,
     extract_triplane_mesh,
+    extract_udf_mesh_from_field,
     flatten_triplane_numpy,
     normalize_latent,
     restore_triplane_numpy,
@@ -209,6 +210,37 @@ def test_triplane_vae_udf_loss_is_regression():
     assert torch.isfinite(loss)
     assert torch.isfinite(recon)
     assert float(kl.item()) == pytest.approx(0.0)
+
+
+def test_udf_extraction_backend_rejects_signed_and_non_crossing_fields():
+    with pytest.raises(ValueError, match="non-negative"):
+        extract_udf_mesh_from_field(np.array([[[-0.1, 0.2], [0.2, 0.2]], [[0.2, 0.2], [0.2, 0.2]]]), 0.1)
+    with pytest.raises(RuntimeError, match="does not cross requested extraction level"):
+        extract_udf_mesh_from_field(np.full((8, 8, 8), 0.2, dtype=np.float32), 0.1)
+
+
+def test_udf_extraction_backend_returns_finite_mesh():
+    axis = np.linspace(-1.0, 1.0, 24, dtype=np.float32)
+    x, y, z = np.meshgrid(axis, axis, axis, indexing="ij")
+    field = np.abs(np.sqrt(x * x + y * y + z * z) - 0.5).astype(np.float32)
+    mesh = extract_udf_mesh_from_field(field, 0.08)
+    assert len(mesh.vertices) > 0 and len(mesh.faces) > 0
+    assert np.isfinite(mesh.vertices).all()
+    assert np.max(np.abs(mesh.bounds)) <= 1.01
+
+
+def test_cached_query_pool_subsampling_preserves_strata_and_changes_sample():
+    ds = SkeletalMeshDataset.__new__(SkeletalMeshDataset)
+    ds.n_query_points = 20
+    source_mask = np.concatenate([np.zeros(50, dtype=bool), np.ones(50, dtype=bool)])
+    points = np.arange(300, dtype=np.float32).reshape(100, 3)
+    labels = np.arange(100, dtype=np.float32)
+    q1, y1, m1 = ds._subsample_query_pool(points, labels, source_mask, np.random.default_rng(1))
+    q2, y2, m2 = ds._subsample_query_pool(points, labels, source_mask, np.random.default_rng(2))
+    assert q1.shape == (20, 3) and y1.shape == (20,) and m1.shape == (20,)
+    assert int(m1.sum()) == 10 and int((~m1).sum()) == 10
+    assert int(m2.sum()) == 10 and int((~m2).sum()) == 10
+    assert not np.array_equal(q1, q2)
 
 
 def test_triplane_udf_rejects_missing_requested_level():
