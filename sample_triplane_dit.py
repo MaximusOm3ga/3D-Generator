@@ -18,7 +18,8 @@ def parse_args():
     p.add_argument("--out-dir", type=str, default="samples_triplane")
     p.add_argument("--num-samples", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--timesteps", type=int, default=200)
+    p.add_argument("--timesteps", type=int, default=None,
+                   help="Defaults to the timestep count saved in the DiT checkpoint.")
     p.add_argument("--sampling-steps", type=int, default=25)
     p.add_argument("--resolution", type=int, default=32)
     p.add_argument("--target-mode", type=str, choices=["occupancy", "udf"], default=None,
@@ -53,7 +54,18 @@ def main():
     dit_cfg = dit_ckpt.get("config") or {}
     latent_channels = int(dit_cfg.get("latent_channels", vae_cfg.get("latent_channels", 8)))
     latent_res = int(dit_cfg.get("latent_res", vae_cfg.get("latent_res", 8)))
-    dit = TriplaneDiT(latent_channels=latent_channels, latent_res=latent_res, width=64, depth=2, heads=4).to(device)
+    width = int(dit_cfg.get("width", 64))
+    depth = int(dit_cfg.get("depth", 2))
+    heads = int(dit_cfg.get("heads", 4))
+    timesteps = int(args.timesteps or dit_cfg.get("timesteps", 200))
+    if args.sampling_steps > timesteps:
+        raise ValueError(
+            f"--sampling-steps={args.sampling_steps} cannot exceed checkpoint timesteps={timesteps}"
+        )
+    dit = TriplaneDiT(
+        latent_channels=latent_channels, latent_res=latent_res,
+        width=width, depth=depth, heads=heads
+    ).to(device)
     dit.load_state_dict(dit_ckpt["model_state"])
     dit.eval()
 
@@ -61,14 +73,14 @@ def main():
     if stats_mean.size == 0:
         stats_mean = np.zeros(latent_channels, dtype=np.float32)
         stats_std = np.ones(latent_channels, dtype=np.float32)
-    _, _, alphas_cumprod = make_triplane_schedule(args.timesteps, device)
+    _, _, alphas_cumprod = make_triplane_schedule(timesteps, device)
     for i in range(args.num_samples):
         torch.manual_seed(args.seed + i)
         z = sample_triplane_latent(
             dit,
             shape=(1, 3, latent_res, latent_res, latent_channels),
             alphas_cumprod=alphas_cumprod,
-            timesteps=args.timesteps,
+            timesteps=timesteps,
             sampling_steps=args.sampling_steps,
             device=args.device,
             seed=args.seed + i,
