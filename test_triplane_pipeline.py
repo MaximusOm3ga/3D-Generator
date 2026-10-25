@@ -72,6 +72,39 @@ def test_triplane_forward_backward_and_gradients():
     assert not missing, f"Trainable parameters without gradients: {missing}"
 
 
+
+def test_triplane_decoder_coordinate_plane_ordering():
+    # grid_sample must preserve XY, YZ and XZ axis conventions with align_corners=True.
+    from vae_model import TriplaneDecoder
+    decoder = TriplaneDecoder(latent_channels=1, embed_dim=4, hidden_dim=8,
+                              plane_resolution=8, udf_scale=0.05, initial_udf=0.01)
+    axis = torch.linspace(-1.0, 1.0, 8)
+    yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+    xy = (xx + 2.0 * yy)[None, None]
+    yz = (xx + 3.0 * yy)[None, None]
+    xz = (xx + 4.0 * yy)[None, None]
+    q = torch.tensor([[[0.2, -0.3, 0.4]]])
+    # Directly exercise the same grid_sample path used by the decoder.
+    xy_v = decoder._sample_plane(xy, q[:, :, [0, 1]]).item()
+    yz_v = decoder._sample_plane(yz, q[:, :, [1, 2]]).item()
+    xz_v = decoder._sample_plane(xz, q[:, :, [0, 2]]).item()
+    assert xy_v == pytest.approx(0.2 + 2 * -0.3, abs=0.08)
+    assert yz_v == pytest.approx(-0.3 + 3 * 0.4, abs=0.08)
+    assert xz_v == pytest.approx(0.2 + 4 * 0.4, abs=0.08)
+
+
+def test_triplane_decoder_outputs_scaled_nonnegative_udf():
+    vae = TriplaneVAE(in_channels=54, hidden_dim=16, latent_channels=2,
+                      latent_res=4, decoder_hidden_dim=16,
+                      decoder_plane_resolution=16, udf_scale=0.05, initial_udf=0.01)
+    query = torch.rand(1, 16, 3) * 2 - 1
+    latent = torch.zeros(1, 3, 4, 4, 2)
+    out = vae.decoder(query, latent)
+    assert torch.isfinite(out).all()
+    assert (out >= 0).all()
+    assert float(out.mean()) < 0.2
+
+
 def test_triplane_one_batch_smoke_train():
     vae = TriplaneVAE(in_channels=54, hidden_dim=16, latent_channels=2, latent_res=4)
     opt = torch.optim.AdamW(vae.parameters(), lr=1e-3)
