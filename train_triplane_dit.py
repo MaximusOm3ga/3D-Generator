@@ -92,8 +92,10 @@ def main():
         total = 0.0
         count = 0
         for batch in loader:
-            z0 = batch["latent"].to(device)
-            bsz = z0.shape[0]
+            bsz = batch["latent"].shape[0]
+            z0 = batch["latent"].to(device).reshape(
+                bsz, 3, latent_res, latent_res, latent_channels
+            )
             t = torch.randint(0, args.timesteps, (bsz,), device=device)
             a_t = alphas_cumprod[t].view(bsz, 1, 1, 1, 1)
             eps = torch.randn_like(z0)
@@ -109,7 +111,21 @@ def main():
         print(f"epoch {epoch + 1}/{args.epochs} train_mse={avg:.6f}")
         if avg < best_loss:
             best_loss = avg
-            payload = {"model_state": model.state_dict(), "config": {"latent_channels": latent_channels, "latent_res": latent_res, "timesteps": args.timesteps, "split": args.split}, "epoch": epoch + 1, "loss": float(best_loss)}
+            payload = {
+                "model_state": model.state_dict(),
+                "config": {
+                    "latent_channels": latent_channels,
+                    "latent_res": latent_res,
+                    "timesteps": args.timesteps,
+                    "split": args.split,
+                    "width": 64,
+                    "depth": 2,
+                    "heads": 4,
+                    "latent_dir": os.path.abspath(args.latent_dir),
+                },
+                "epoch": epoch + 1,
+                "loss": float(best_loss),
+            }
             torch.save(payload, os.path.join(args.checkpoint_dir, "dit_best.pt"))
         torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "loss": avg}, os.path.join(args.checkpoint_dir, "dit_last.pt"))
 
