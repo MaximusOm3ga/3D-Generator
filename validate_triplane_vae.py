@@ -6,6 +6,7 @@ both the source mesh and reconstruction plus a JSON report. Defaults are chosen
 for a 4 GiB GPU; lower --batch-size or use --device cpu if needed.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from dataset import SkeletalMeshDataset
 from triplane_pipeline import (
     _resolve_udf_extraction_level,
     decode_triplane_batch,
+    extract_udf_mesh_from_field,
     save_json,
 )
 from vae_model import TriplaneVAE
@@ -118,9 +120,12 @@ def extract_mesh_from_field(field, threshold, target_mode):
     else:
         effective_level = _resolve_udf_extraction_level(field, requested_level)
 
-    vertices, faces, _, _ = measure.marching_cubes(field, level=effective_level)
-    vertices = vertices * (2.0 / (field.shape[0] - 1)) - 1.0
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    if target_mode == "udf":
+        mesh = extract_udf_mesh_from_field(field, effective_level)
+    else:
+        vertices, faces, _, _ = measure.marching_cubes(field, level=effective_level)
+        vertices = vertices * (2.0 / (field.shape[0] - 1)) - 1.0
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     return mesh, {
         "field_min": field_min,
         "field_max": field_max,
@@ -147,6 +152,40 @@ def dense_reference_udf(mesh, resolution, chunk_size, scale=1.0):
         dist = np.linalg.norm(points - np.asarray(closest, dtype=np.float32), axis=-1)
         values[start:start + len(points)] = np.clip(dist / max(float(scale), 1e-8), 0.0, 1.0)
     return values.reshape(resolution, resolution, resolution)
+
+
+def cached_dense_reference_udf(mesh, mesh_path, resolution, chunk_size, scale=1.0, cache_dir="udf_reference_cache"):
+    """Load or compute a reference grid with a content/settings-addressed cache key."""
+    os.makedirs(cache_dir, exist_ok=True)
+    digest = hashlib.sha256()
+    with open(mesh_path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    key = "|".join([
+        digest.hexdigest(), str(int(resolution)), str(int(chunk_size)),
+        f"scale={float(scale):.12g}", "bounds=-1,1", "grid=ij", "reference-udf-v2",
+    ])
+    cache_name = hashlib.sha256(key.encode("utf-8")).hexdigest() + ".npz"
+    cache_path = os.path.join(cache_dir, cache_name)
+    expected_shape = (int(resolution), int(resolution), int(resolution))
+    if os.path.exists(cache_path):
+        try:
+            with np.load(cache_path, allow_pickle=False) as cached:
+                field = np.asarray(cached["field"], dtype=np.float32)
+                stored_key = str(cached["key"].item())
+            if stored_key == key and field.shape == expected_shape and np.isfinite(field).all():
+                print(f"[REFERENCE CACHE] HIT {cache_path}", flush=True)
+                return field
+        except Exception:
+            pass
+    field = dense_reference_udf(mesh, resolution, chunk_size, scale=scale)
+    if field.shape != expected_shape or not np.isfinite(field).all():
+        raise ValueError("Computed reference UDF grid has invalid shape or non-finite values.")
+    temp_path = f"{cache_path}.{os.getpid()}.tmp.npz"
+    np.savez_compressed(temp_path, field=field.astype(np.float32), key=np.asarray(key, dtype="U512"))
+    os.replace(temp_path, cache_path)
+    print(f"[REFERENCE CACHE] CREATED {cache_path}", flush=True)
+    return field
 
 
 def field_fit_metrics(prediction, target, near_band=0.05):
@@ -280,8 +319,9 @@ def main():
     dense_grid_fit = None
     if args.target_mode == "udf":
         print("[INFO] Computing exact reference UDF on the same dense grid (CPU nearest-surface queries)...", flush=True)
-        reference_field = dense_reference_udf(
-            source_mesh, args.resolution, args.reference_chunk_size, scale=1.0
+        reference_field = cached_dense_reference_udf(
+            source_mesh, source_path, args.resolution, args.reference_chunk_size,
+            scale=1.0, cache_dir=args.reference_cache_dir,
         )
         dense_grid_fit = field_fit_metrics(field, reference_field, args.udf_near_band)
         del reference_field

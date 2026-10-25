@@ -25,6 +25,12 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--n-surface-points", type=int, default=2048)
     p.add_argument("--n-query-points", type=int, default=2048)
+    p.add_argument("--n-surface-cache-points", type=int, default=16384,
+                   help="Surface samples cached per mesh; each access draws n-surface-points from this pool.")
+    p.add_argument("--n-query-cache-points", type=int, default=65536,
+                   help="UDF/occupancy target pool cached per mesh; each access draws n-query-points from this pool.")
+    p.add_argument("--surface-cache-dir", type=str, default=None,
+                   help="Optional directory for cached surface points/normals (defaults under cache-dir).")
     p.add_argument("--in-channels", type=int, default=DEFAULT_TRIPLANE_CONFIG["in_channels"])
     p.add_argument("--hidden-dim", type=int, default=DEFAULT_TRIPLANE_CONFIG["hidden_dim"])
     p.add_argument("--latent-channels", type=int, default=DEFAULT_TRIPLANE_CONFIG["latent_channels"])
@@ -68,6 +74,9 @@ def build_loader(args):
         include_sdf=False,
         target_mode=args.target_mode,
         target_cache_dir=args.target_cache_dir,
+        surface_cache_dir=args.surface_cache_dir,
+        n_surface_cache_points=args.n_surface_cache_points,
+        n_query_cache_points=args.n_query_cache_points,
     )
     if args.debug_one_object:
         idx = min(max(args.debug_object_index, 0), len(dataset) - 1)
@@ -262,6 +271,8 @@ def main():
                 "udf_scale": args.udf_scale,
                 "initial_udf": args.initial_udf,
                 "udf_surface_weight": args.udf_surface_weight,
+                "n_surface_cache_points": args.n_surface_cache_points,
+                "n_query_cache_points": args.n_query_cache_points,
                 "target_mode": args.target_mode,
                 "preprocessing_version": 3,
             },

@@ -83,9 +83,20 @@ class SkeletalMeshDataset(Dataset):
         seed=42,
         deterministic=True,
         target_cache_dir="udf_target_cache",
+        surface_cache_dir=None,
+        n_surface_cache_points=16384,
+        n_query_cache_points=65536,
     ):
         self.target_cache_dir = os.path.abspath(target_cache_dir)
+        self.surface_cache_dir = os.path.abspath(surface_cache_dir or os.path.join(cache_dir, "surface_point_cache"))
         os.makedirs(self.target_cache_dir, exist_ok=True)
+        os.makedirs(self.surface_cache_dir, exist_ok=True)
+        self.n_surface_cache_points = int(n_surface_cache_points)
+        self.n_query_cache_points = max(int(n_query_cache_points), int(n_query_points))
+        if self.n_surface_cache_points < int(n_surface_points):
+            raise ValueError("n_surface_cache_points must be >= n_surface_points")
+        if self.n_query_cache_points < int(n_query_points):
+            raise ValueError("n_query_cache_points must be >= n_query_points")
         self.paths = sorted(glob.glob(os.path.join(cache_dir, "*.npz")))
         total_cache_paths = len(self.paths)
         print(f"[DATA] Found {total_cache_paths} cache files; validating metadata...", flush=True)
@@ -104,6 +115,13 @@ class SkeletalMeshDataset(Dataset):
                     flush=True,
                 )
         self.paths = valid_paths
+        self._mesh_fingerprints = {}
+        for path in self.paths:
+            digest = hashlib.sha256()
+            with open(path, "rb") as mesh_file:
+                for chunk in iter(lambda: mesh_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            self._mesh_fingerprints[path] = digest.hexdigest()
         print(
             f"[DATA] Cache validation finished: {len(self.paths)}/{total_cache_paths} valid "
             f"in {time.time() - validation_started:.1f}s",
@@ -130,27 +148,79 @@ class SkeletalMeshDataset(Dataset):
         self.seed = int(seed)
         self.deterministic = bool(deterministic)
         self.failed_items = set()
+        self._access_counts = {}
+        self._access_counts = {}
 
     def __len__(self):
         return len(self.paths)
 
     def _target_cache_path(self, idx):
         key = "|".join([
-            os.path.basename(self.paths[idx]),
-            self.target_mode,
-            str(self.n_query_points),
-            str(self.near_surface_std),
-            str(self.sdf_scale),
-            str(self.seed + int(idx)),
-            str(PREPROCESS_VERSION),
+            self._mesh_fingerprints[self.paths[idx]], self.target_mode,
+            str(self.n_query_cache_points), str(self.near_surface_std),
+            str(self.sdf_scale), str(self.seed + int(idx)),
+            str(PREPROCESS_VERSION), "bounds=-1,1", "udf-cache-v2",
         ])
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         return os.path.join(self.target_cache_dir, f"{digest}.npz")
 
+    def _surface_cache_path(self, idx):
+        key = "|".join([
+            self._mesh_fingerprints[self.paths[idx]], str(self.n_surface_cache_points),
+            str(PREPROCESS_VERSION), "bounds=-1,1", "surface-cache-v2",
+        ])
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return os.path.join(self.surface_cache_dir, f"{digest}.npz")
+
+    def _load_or_create_surface_cache(self, idx, mesh):
+        path = self._surface_cache_path(idx)
+        if os.path.exists(path):
+            try:
+                with np.load(path, allow_pickle=False) as cached:
+                    points = np.asarray(cached["surface_points"], dtype=np.float32)
+                    normals = np.asarray(cached["face_normals"], dtype=np.float32)
+                if (points.shape == (self.n_surface_cache_points, 3)
+                        and normals.shape == points.shape
+                        and np.isfinite(points).all() and np.isfinite(normals).all()):
+                    return points, normals
+            except Exception:
+                pass
+        rng = np.random.default_rng(self.seed + idx)
+        state = np.random.get_state()
+        try:
+            np.random.seed(int(rng.integers(0, 2**31 - 1)))
+            points, face_idx = trimesh.sample.sample_surface(mesh, self.n_surface_cache_points)
+        finally:
+            np.random.set_state(state)
+        points = np.asarray(points, dtype=np.float32)
+        normals = np.asarray(mesh.face_normals[face_idx], dtype=np.float32)
+        if not np.isfinite(points).all() or not np.isfinite(normals).all():
+            raise ValueError(f"Non-finite surface cache generated for {self.paths[idx]}")
+        tmp_path = f"{path}.{os.getpid()}.tmp.npz"
+        np.savez_compressed(tmp_path, surface_points=points, face_normals=normals)
+        os.replace(tmp_path, path)
+        return points, normals
+
+    def _subsample_query_pool(self, query_points, labels, source_mask, rng):
+        n_uniform = self.n_query_points // 2
+        n_near = self.n_query_points - n_uniform
+        uniform_idx = np.flatnonzero(~source_mask)
+        near_idx = np.flatnonzero(source_mask)
+        if len(uniform_idx) < n_uniform or len(near_idx) < n_near:
+            raise ValueError("Cached query pool lacks enough points in both sampling strata.")
+        selected = np.concatenate([
+            rng.choice(uniform_idx, n_uniform, replace=False),
+            rng.choice(near_idx, n_near, replace=False),
+        ])
+        rng.shuffle(selected)
+        return query_points[selected], (None if labels is None else labels[selected]), source_mask[selected]
+
     def _rng_for_item(self, idx):
         if not self.deterministic:
             return np.random.default_rng()
-        return np.random.default_rng(self.seed + max(int(idx), 0))
+        count = self._access_counts.get(int(idx), 0)
+        self._access_counts[int(idx)] = count + 1
+        return np.random.default_rng(self.seed + max(int(idx), 0) + count * 1000003)
 
     def _sample_occupancy(self, mesh, n_points, rng=None):
         if rng is None:
@@ -281,13 +351,10 @@ class SkeletalMeshDataset(Dataset):
             )
             rng = self._rng_for_item(idx)
 
-            state = np.random.get_state()
-            try:
-                np.random.seed(int(rng.integers(0, 2**31 - 1)))
-                surface_points, face_idx = trimesh.sample.sample_surface(mesh, self.n_surface_points)
-            finally:
-                np.random.set_state(state)
-            face_normals = mesh.face_normals[face_idx].astype(np.float32)
+            cached_surface_points, cached_face_normals = self._load_or_create_surface_cache(idx, mesh)
+            selected_surface = rng.choice(len(cached_surface_points), self.n_surface_points, replace=False)
+            surface_points = cached_surface_points[selected_surface]
+            face_normals = cached_face_normals[selected_surface]
 
             query_points, occupancy_labels, sdf_labels, source_mask = None, None, None, None
             if self.include_occupancy or self.include_udf or self.include_sdf:
@@ -303,18 +370,18 @@ class SkeletalMeshDataset(Dataset):
                             if self.include_udf or self.include_sdf:
                                 sdf_labels = np.asarray(cached["udf_labels"], dtype=np.float32)
                         if (
-                            query_points.shape != (self.n_query_points, 3)
-                            or source_mask.shape != (self.n_query_points,)
+                            query_points.shape != (self.n_query_cache_points, 3)
+                            or source_mask.shape != (self.n_query_cache_points,)
                             or not np.isfinite(query_points).all()
                         ):
                             raise ValueError("invalid cached target shapes or values")
                         if self.include_occupancy and (
-                            occupancy_labels.shape != (self.n_query_points,)
+                            occupancy_labels.shape != (self.n_query_cache_points,)
                             or not np.isfinite(occupancy_labels).all()
                         ):
                             raise ValueError("invalid cached occupancy labels")
                         if (self.include_udf or self.include_sdf) and (
-                            sdf_labels.shape != (self.n_query_points,)
+                            sdf_labels.shape != (self.n_query_cache_points,)
                             or not np.isfinite(sdf_labels).all()
                             or np.any(sdf_labels < 0.0)
                         ):
@@ -330,7 +397,7 @@ class SkeletalMeshDataset(Dataset):
                     for attempt in range(max_attempts):
                         try:
                             query_points, occupancy_labels, sdf_labels, source_mask = self._sample_query_targets(
-                                mesh, self.n_query_points, rng=rng
+                                mesh, self.n_query_cache_points, rng=rng
                             )
                             break
                         except Exception as exc:
@@ -355,6 +422,15 @@ class SkeletalMeshDataset(Dataset):
                     np.savez_compressed(tmp_path, **cache_values)
                     os.replace(tmp_path, target_path)
                     print(f"[TARGET CACHE] CREATED {idx + 1}/{len(self.paths)}", flush=True)
+
+                query_label_pool = sdf_labels if self.target_mode == "udf" else occupancy_labels
+                query_points, sampled_labels, source_mask = self._subsample_query_pool(
+                    query_points, query_label_pool, source_mask, rng
+                )
+                if self.target_mode == "udf":
+                    sdf_labels, occupancy_labels = sampled_labels, None
+                else:
+                    occupancy_labels, sdf_labels = sampled_labels, None
 
             if "skeleton_points" in data:
                 skeleton_points = np.asarray(data["skeleton_points"], dtype=np.float32)
