@@ -59,7 +59,13 @@ def restore_triplane_latent(latent, latent_res: int, latent_channels: int):
 def flatten_triplane_numpy(latent: np.ndarray) -> np.ndarray:
     latent = np.asarray(latent, dtype=np.float32)
     if latent.ndim == 5:
+        # Batched [B, 3, H, W, C] -> [B, 3*H*W, C].
         return latent.reshape(latent.shape[0], 3 * latent.shape[2] * latent.shape[3], latent.shape[4])
+    if latent.ndim == 4:
+        # Single sample [3, H, W, C] -> [3*H*W, C].
+        if latent.shape[0] != 3:
+            raise ValueError(f"Expected single triplane latent [3,H,W,C], got {latent.shape}")
+        return latent.reshape(3 * latent.shape[1] * latent.shape[2], latent.shape[3])
     if latent.ndim == 3:
         return latent.reshape(-1, latent.shape[-1])
     if latent.ndim == 2:
