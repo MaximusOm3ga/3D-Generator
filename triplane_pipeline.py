@@ -283,6 +283,18 @@ def extract_triplane_mesh(vae: TriplaneVAE, latent: torch.Tensor, *, resolution:
 
 
 def sample_triplane_latent(dit: TriplaneDiT, *, shape: Tuple[int, int, int, int, int], alphas_cumprod: torch.Tensor, timesteps: int, sampling_steps: int, device: str = "cpu", seed: Optional[int] = None):
+    if timesteps < 1:
+        raise ValueError(f"timesteps must be positive, got {timesteps}")
+    if sampling_steps < 1 or sampling_steps > timesteps:
+        raise ValueError(
+            f"sampling_steps must be in [1, timesteps], got {sampling_steps} for timesteps={timesteps}"
+        )
+    if alphas_cumprod.ndim != 1 or alphas_cumprod.numel() != timesteps:
+        raise ValueError(
+            f"Expected alphas_cumprod with shape [{timesteps}], got {tuple(alphas_cumprod.shape)}"
+        )
+    if len(shape) != 5 or shape[1] != 3:
+        raise ValueError(f"Expected latent shape [B,3,H,W,C], got {shape}")
     if seed is not None:
         torch.manual_seed(seed)
     z = torch.randn(shape, device=device)
