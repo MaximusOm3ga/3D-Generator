@@ -238,6 +238,16 @@ def main():
         model, latent, resolution=args.resolution, batch_size=args.batch_size,
         device=device, threshold=args.threshold, target_mode=args.target_mode,
     )
+    # Persist the model output before CPU reference-UDF evaluation or mesh extraction.
+    np.savez_compressed(
+        out_dir / "decoded_field.npz",
+        predicted_field=field.astype(np.float32),
+        resolution=np.int32(args.resolution),
+        target_mode=np.asarray(args.target_mode),
+        threshold=np.float32(args.threshold),
+        object_index=np.int32(args.object_index),
+    )
+    print(f"[INFO] Saved decoded field to {out_dir / 'decoded_field.npz'}", flush=True)
     reconstructed_mesh = None
     extraction_error = None
     field_min, field_max = float(np.min(field)), float(np.max(field))
