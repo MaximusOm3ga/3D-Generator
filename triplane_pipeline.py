@@ -257,6 +257,37 @@ def _resolve_udf_extraction_level(field: np.ndarray, threshold: float) -> float:
     return float(threshold)
 
 
+def extract_udf_mesh_from_field(field: np.ndarray, level: float, *, unit_scale: float = 1.0) -> trimesh.Trimesh:
+    """Extract an isosurface from a non-negative unsigned-distance field.
+
+    This backend intentionally requires a positive, crossed UDF level and
+    rejects signed/invalid fields rather than silently manufacturing geometry.
+    It keeps all connected components because thin airplane parts can be
+    disconnected in low-resolution predictions.
+    """
+    field = np.asarray(field, dtype=np.float32)
+    level = float(level)
+    if field.ndim != 3 or min(field.shape) < 2:
+        raise ValueError(f"Expected a 3-D UDF grid with each dimension >= 2, got {field.shape}")
+    if not np.isfinite(field).all():
+        raise ValueError("UDF grid contains NaN or Inf.")
+    if float(field.min()) < -1e-6:
+        raise ValueError("UDF extraction expects a non-negative unsigned-distance field.")
+    if level <= 0.0:
+        raise ValueError(f"UDF extraction level must be positive, got {level}.")
+    _resolve_udf_extraction_level(field, level)
+    vertices, faces, _, _ = measure.marching_cubes(field, level=level)
+    vertices = vertices * (2.0 / (field.shape[0] - 1)) - 1.0
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    mesh.apply_scale(float(unit_scale))
+    # Validate and remove degenerate faces without filtering disconnected parts.
+    mesh.process(validate=True)
+    mesh.remove_unreferenced_vertices()
+    if len(mesh.faces) == 0 or not np.isfinite(mesh.vertices).all():
+        raise RuntimeError("UDF extraction produced an empty or non-finite mesh.")
+    return mesh
+
+
 def extract_triplane_mesh(vae: TriplaneVAE, latent: torch.Tensor, *, resolution: int = 32, threshold: float = 0.5, batch_size: int = 16384, unit_scale: float = 1.0, target_mode: str = "occupancy"):
     if latent.dim() == 5 and latent.shape[0] == 1:
         latent = latent[0]
@@ -271,10 +302,11 @@ def extract_triplane_mesh(vae: TriplaneVAE, latent: torch.Tensor, *, resolution:
                 f"UDF field does not cross requested level={threshold}; using effective extraction level={level:.6f} "
                 f"(field min={float(field.min()):.6f}, max={float(field.max()):.6f})."
             )
+    if str(target_mode).lower() == "udf":
+        return extract_udf_mesh_from_field(field, level, unit_scale=unit_scale)
     verts, faces, _, _ = measure.marching_cubes(field, level=level)
     if len(faces) == 0:
-        mode_label = "threshold" if str(target_mode).lower() == "occupancy" else "level"
-        raise RuntimeError(f"Marching cubes failed to produce faces for {mode_label}={level}")
+        raise RuntimeError(f"Marching cubes failed to produce faces for threshold={level}")
     scale = 2.0 / (resolution - 1)
     verts = verts * scale - 1.0
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
@@ -360,6 +392,7 @@ __all__ = [
     "ensure_triplane_checkpoint_compatibility",
     "decode_triplane_batch",
     "extract_triplane_mesh",
+    "extract_udf_mesh_from_field",
     "sample_triplane_latent",
     "make_triplane_schedule",
     "alpha_bar",
