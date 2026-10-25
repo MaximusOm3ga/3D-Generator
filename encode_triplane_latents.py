@@ -72,6 +72,7 @@ def main():
         hidden_dim=cfg.get("hidden_dim", 128),
         latent_channels=cfg.get("latent_channels", 8),
         latent_res=cfg.get("latent_res", 8),
+        decoder_hidden_dim=cfg.get("decoder_hidden_dim", 128),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()

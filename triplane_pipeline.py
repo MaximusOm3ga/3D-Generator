@@ -244,19 +244,17 @@ def _resolve_udf_extraction_level(field: np.ndarray, threshold: float) -> float:
     field_max = float(field.max())
     if field_max <= field_min:
         raise RuntimeError(f"UDF field is degenerate: min={field_min:.5f}, max={field_max:.5f}")
-    if field_min <= threshold <= field_max:
-        return float(threshold)
-    span = max(field_max - field_min, 1e-6)
-    epsilon = max(1e-6, span * 1e-4)
-    if threshold < field_min:
-        level = field_min + epsilon
-    else:
-        level = field_max - epsilon
-    if level <= field_min:
-        level = field_min + epsilon
-    if level >= field_max:
-        level = field_max - epsilon
-    return float(level)
+    # A UDF isosurface must use the requested physical distance level. Picking
+    # a nearby min/max level when the field never crosses the requested value
+    # fabricates a surface and hides a failed distance-field prediction.
+    if not field_min < threshold < field_max:
+        raise RuntimeError(
+            f"UDF field does not cross requested extraction level={threshold:.6g}; "
+            f"min={field_min:.6g}, max={field_max:.6g}. "
+            "No automatic extraction-level fallback is allowed. "
+            "Inspect the predicted/reference UDF fields before extracting a mesh."
+        )
+    return float(threshold)
 
 
 def extract_triplane_mesh(vae: TriplaneVAE, latent: torch.Tensor, *, resolution: int = 32, threshold: float = 0.5, batch_size: int = 16384, unit_scale: float = 1.0, target_mode: str = "occupancy"):
@@ -285,26 +283,48 @@ def extract_triplane_mesh(vae: TriplaneVAE, latent: torch.Tensor, *, resolution:
 
 
 def sample_triplane_latent(dit: TriplaneDiT, *, shape: Tuple[int, int, int, int, int], alphas_cumprod: torch.Tensor, timesteps: int, sampling_steps: int, device: str = "cpu", seed: Optional[int] = None):
+    if timesteps < 1:
+        raise ValueError(f"timesteps must be positive, got {timesteps}")
+    if sampling_steps < 1 or sampling_steps > timesteps:
+        raise ValueError(
+            f"sampling_steps must be in [1, timesteps], got {sampling_steps} for timesteps={timesteps}"
+        )
+    if alphas_cumprod.ndim != 1 or alphas_cumprod.numel() != timesteps:
+        raise ValueError(
+            f"Expected alphas_cumprod with shape [{timesteps}], got {tuple(alphas_cumprod.shape)}"
+        )
+    if len(shape) != 5 or shape[1] != 3:
+        raise ValueError(f"Expected latent shape [B,3,H,W,C], got {shape}")
     if seed is not None:
         torch.manual_seed(seed)
     z = torch.randn(shape, device=device)
-    steps = torch.linspace(timesteps - 1, 0, steps=sampling_steps, device=device).long()
-    steps = torch.unique(steps, sorted=False).flip(0)
-    for i, t_idx in enumerate(steps):
+    # Preserve descending diffusion-time order. torch.unique(..., sorted=False)
+    # does not guarantee the order required by reverse diffusion.
+    raw_steps = torch.linspace(
+        timesteps - 1, 0, steps=sampling_steps, device=device
+    ).round().long().tolist()
+    step_values = []
+    for value in raw_steps:
+        if not step_values or value < step_values[-1]:
+            step_values.append(value)
+    if not step_values:
+        raise ValueError("No valid reverse-diffusion timesteps were generated.")
+    for i, t_value in enumerate(step_values):
+        t_idx = torch.tensor(t_value, device=device, dtype=torch.long)
         t = torch.full((shape[0],), int(t_idx.item()), device=device, dtype=torch.long)
         eps = dit(z, t)
         ab_t = alphas_cumprod[t].view(-1, 1, 1, 1, 1).clamp_min(1e-8)
         sqrt_ab_t = torch.sqrt(ab_t)
         sqrt_one_minus_ab_t = torch.sqrt(1.0 - ab_t)
         z0_hat = (z - sqrt_one_minus_ab_t * eps) / sqrt_ab_t.clamp_min(1e-8)
-        if i + 1 < len(steps):
-            t_prev_val = int(steps[i + 1].item())
+        if i + 1 < len(step_values):
+            t_prev_val = step_values[i + 1]
+            t_prev = torch.full((shape[0],), t_prev_val, device=device, dtype=torch.long)
+            ab_prev = alphas_cumprod[t_prev].view(-1, 1, 1, 1, 1).clamp_min(1e-8)
         else:
-            t_prev_val = 0
-        t_prev = torch.full((shape[0],), t_prev_val, device=device, dtype=torch.long)
-        ab_prev = alphas_cumprod[t_prev].view(-1, 1, 1, 1, 1).clamp_min(1e-8)
-        sigma = 0.0
-        z = torch.sqrt(ab_prev) * z0_hat + torch.sqrt((1.0 - ab_prev - sigma ** 2).clamp_min(0.0)) * eps
+            # alpha_bar(-1)=1: the final DDIM step returns the predicted clean latent.
+            ab_prev = torch.ones((shape[0], 1, 1, 1, 1), device=device, dtype=z.dtype)
+        z = torch.sqrt(ab_prev) * z0_hat + torch.sqrt((1.0 - ab_prev).clamp_min(0.0)) * eps
     return z
 
 

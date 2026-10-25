@@ -184,9 +184,9 @@ def main():
     model, checkpoint, config = load_model(args.checkpoint, device)
     checkpoint_mode = config.get("target_mode")
     if checkpoint_mode and checkpoint_mode != args.target_mode:
-        print(
-            f"[WARN] Checkpoint target_mode={checkpoint_mode!r}, but requested "
-            f"target_mode={args.target_mode!r}. Confirm these match training."
+        raise ValueError(
+            f"Checkpoint target_mode={checkpoint_mode!r} does not match requested "
+            f"target_mode={args.target_mode!r}. Validate using the mode used during training."
         )
 
     dataset = SkeletalMeshDataset(
@@ -235,10 +235,28 @@ def main():
         model, latent, resolution=args.resolution, batch_size=args.batch_size,
         device=device, threshold=args.threshold, target_mode=args.target_mode,
     )
-    reconstructed_mesh, field_metrics = extract_mesh_from_field(
-        field, args.threshold, args.target_mode
-    )
-    reconstructed_mesh.export(out_dir / "reconstruction.obj")
+    reconstructed_mesh = None
+    extraction_error = None
+    field_min, field_max = float(np.min(field)), float(np.max(field))
+    field_metrics = {
+        "field_min": field_min,
+        "field_max": field_max,
+        "field_mean": float(np.mean(field)),
+        "field_std": float(np.std(field)),
+        "requested_level": float(args.threshold),
+        "effective_level": None,
+        "level_was_adjusted": False,
+    }
+    try:
+        reconstructed_mesh, field_metrics = extract_mesh_from_field(
+            field, args.threshold, args.target_mode
+        )
+        reconstructed_mesh.export(out_dir / "reconstruction.obj")
+    except Exception as exc:
+        extraction_error = str(exc)
+        print(f"[ERROR] Reconstruction extraction failed: {extraction_error}", flush=True)
+        # Continue field-fit diagnostics and write report.json so a failed
+        # threshold crossing is recorded as a result, not lost as a traceback.
 
     threshold_sweep = {}
     if args.target_mode == "udf":
@@ -267,7 +285,8 @@ def main():
 
     metrics = {
         "source_mesh": mesh_summary(source_mesh),
-        "reconstruction_mesh": mesh_summary(reconstructed_mesh),
+        "reconstruction_mesh": mesh_summary(reconstructed_mesh) if reconstructed_mesh is not None else None,
+        "mesh_extraction_error": extraction_error,
         "decoded_field": field_metrics,
         "dense_grid_fit": dense_grid_fit,
         "threshold_sweep": threshold_sweep,
@@ -308,9 +327,12 @@ def main():
                 )
 
     source_components = metrics["source_mesh"]["component_count"]
-    recon_components = metrics["reconstruction_mesh"]["component_count"]
+    recon_components = (
+        metrics["reconstruction_mesh"]["component_count"]
+        if metrics["reconstruction_mesh"] is not None else 0
+    )
     metrics["diagnostic_flags"] = {
-        "reconstruction_is_empty": len(reconstructed_mesh.faces) == 0,
+        "reconstruction_is_empty": reconstructed_mesh is None or len(reconstructed_mesh.faces) == 0,
         "reconstruction_has_many_components": recon_components > 10,
         "source_has_many_components": source_components > 10,
         "warning": (

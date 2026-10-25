@@ -211,19 +211,18 @@ def test_triplane_vae_udf_loss_is_regression():
     assert float(kl.item()) == pytest.approx(0.0)
 
 
-def test_triplane_udf_extracts_positive_shifted_field_with_effective_level():
+def test_triplane_udf_rejects_missing_requested_level():
     class DummyVAE:
         def __init__(self):
             self.decoder = lambda query_points, latent: 0.1 + torch.abs(torch.linalg.norm(query_points, dim=-1) - 0.5)
             self.parameters = lambda: iter([torch.nn.Parameter(torch.zeros(1))])
 
     latent = torch.zeros(1, 3, 4, 4, 2)
-    field = decode_triplane_batch(DummyVAE(), latent, resolution=8, batch_size=64, device=torch.device('cpu'), threshold=0.0, target_mode='udf')
-    assert field.shape == (8, 8, 8)
-    assert np.all(np.isfinite(field))
-    assert float(field.min()) > 0.0
-    mesh = extract_triplane_mesh(DummyVAE(), latent, resolution=8, threshold=0.0, batch_size=64, target_mode='udf')
-    assert len(mesh.faces) > 0
+    with pytest.raises(RuntimeError, match="does not cross requested extraction level"):
+        extract_triplane_mesh(
+            DummyVAE(), latent, resolution=8, threshold=0.01,
+            batch_size=64, target_mode="udf"
+        )
 
 
 def test_triplane_decode_rejects_field_without_threshold_crossing():
