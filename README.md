@@ -19,11 +19,13 @@ The model uses a DDPM objective over point coordinates, a transformer denoiser, 
 2. Enable a GPU accelerator.
 3. Clone this repository, or use the repository files already in the notebook.
 
-Install dependencies:
+Install the core dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
+
+For Poisson mesh reconstruction, optionally install Open3D separately with `pip install open3d`. Without it, the sampler falls back to a convex hull, which is only a coarse mesh approximation.
 
 Prepare normalized surface samples. The script recursively scans supported mesh files and uses the first directory below the dataset root as the category by default. Adjust `--category-depth` for another layout.
 
@@ -96,4 +98,4 @@ Run lightweight tests (no GPU or dataset required):
 python -m unittest discover -s tests -v
 ```
 
-The tests cover normalization, model output shape, diffusion loss, and checkpoint-independent sampling mechanics. They do not prove learned generation quality; that requires a real training run and inspection of exported samples.
+The tests cover normalization, model output shape, and diffusion loss. They do not prove learned generation quality; that requires a real training run and inspection of exported samples.
