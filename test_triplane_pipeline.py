@@ -106,6 +106,13 @@ def test_triplane_latent_flatten_roundtrip():
     assert restored.shape == latent.shape
     assert np.allclose(restored, latent.numpy())
 
+def test_single_triplane_latent_flatten_shape():
+    # VAE.encode returns [B,3,H,W,C]; exporting one item uses [3,H,W,C].
+    latent = np.random.randn(3, 8, 8, 8).astype(np.float32)
+    flat = flatten_triplane_numpy(latent)
+    assert flat.shape == (3 * 8 * 8, 8)
+    assert np.allclose(flat.reshape(3, 8, 8, 8), latent)
+
 
 def test_triplane_channelwise_normalization_and_split_roundtrip(tmp_path):
     latent = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
