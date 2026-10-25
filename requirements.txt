@@ -3,5 +3,3 @@ torch>=2.1
 trimesh>=4.0
 scipy>=1.10
 tqdm>=4.65
-# Optional but recommended for Poisson point-cloud-to-mesh reconstruction:
-open3d>=0.18
