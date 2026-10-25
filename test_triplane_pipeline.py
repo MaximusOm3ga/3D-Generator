@@ -54,9 +54,22 @@ def test_triplane_forward_backward_and_gradients():
     feat, xyz, query = _make_sample()
     logits, mean, logvar = vae(feat, xyz, query)
     labels = torch.rand_like(logits)
-    loss = ((logits - labels) ** 2).mean()
+    # The posterior log-variance head is trained by the KL term, not by the
+    # reconstruction-only loss. Exercise the same combined objective used in
+    # training so this test checks gradients for every trainable parameter.
+    loss, recon_loss, kl_loss = vae_loss(
+        logits, labels, mean, logvar,
+        kl_weight=1e-4, target_mode="udf"
+    )
+    assert torch.isfinite(loss)
+    assert torch.isfinite(recon_loss)
+    assert torch.isfinite(kl_loss)
     loss.backward()
-    assert all(p.grad is not None for p in vae.parameters() if p.requires_grad)
+    missing = [
+        name for name, param in vae.named_parameters()
+        if param.requires_grad and param.grad is None
+    ]
+    assert not missing, f"Trainable parameters without gradients: {missing}"
 
 
 def test_triplane_one_batch_smoke_train():
@@ -66,7 +79,10 @@ def test_triplane_one_batch_smoke_train():
     labels = torch.randint(0, 2, (2, 24), dtype=torch.float32)
     for _ in range(2):
         logits, mean, logvar = vae(feat, xyz, query)
-        loss = ((logits - labels) ** 2).mean()
+        loss, _, _ = vae_loss(
+            logits, labels, mean, logvar,
+            kl_weight=1e-4, target_mode="udf"
+        )
         opt.zero_grad()
         loss.backward()
         opt.step()
