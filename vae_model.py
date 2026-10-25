@@ -392,6 +392,8 @@ def vae_loss(
     udf_mask=None,
     udf_near_weight=4.0,
     udf_near_band=0.05,
+    pred_surface_udf=None,
+    udf_surface_weight=4.0,
 ):
     """Target mode dispatch for occupancy and UDF supervision.
 
@@ -418,6 +420,8 @@ def vae_loss(
             torch.ones_like(per_point_loss),
         )
         recon_loss = (per_point_loss * weights).sum() / weights.sum().clamp_min(1.0)
+        if pred_surface_udf is not None:
+            recon_loss = recon_loss + float(udf_surface_weight) * pred_surface_udf.abs().mean()
     else:
         labels = labels.float()
         if pos_weight is None:
