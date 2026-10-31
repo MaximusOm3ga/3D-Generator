@@ -80,7 +80,11 @@ def discover_meshes(root: str | Path, category_depth: int = 1) -> list[tuple[Pat
 class PointCloudNPZDataset(Dataset):
     """Loads a prepared NPZ of arrays: points [N,P,3], labels [N], class_names [C]."""
 
-    def __init__(self, npz_path: str | Path, indices: np.ndarray | None = None):
+    def __init__(
+        self, npz_path: str | Path, indices: np.ndarray | None = None,
+        num_points: int | None = None, random_subsample: bool = False,
+        label_remap: dict[int, int] | None = None,
+    ):
         archive = np.load(npz_path, allow_pickle=False)
         self.points = archive["points"]
         self.labels = archive["labels"]
@@ -89,6 +93,11 @@ class PointCloudNPZDataset(Dataset):
             raise ValueError(f"points must be [N,P,3], got {self.points.shape}")
         if self.labels.shape != (len(self.points),):
             raise ValueError("labels must have shape [N]")
+        if num_points is not None and not 1 <= num_points <= self.points.shape[1]:
+            raise ValueError(f"num_points must be in [1, {self.points.shape[1]}]")
+        self.num_points = num_points
+        self.random_subsample = bool(random_subsample)
+        self.label_remap = label_remap
         self.indices = np.arange(len(self.points)) if indices is None else np.asarray(indices)
 
     def __len__(self) -> int:
@@ -96,9 +105,22 @@ class PointCloudNPZDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         idx = int(self.indices[index])
+        points = np.asarray(self.points[idx], dtype=np.float32)
+        if self.num_points is not None and len(points) > self.num_points:
+            if self.random_subsample:
+                selected = np.random.choice(len(points), self.num_points, replace=False)
+            else:
+                # Stable per-object subset for repeatable validation.
+                selected = np.random.default_rng(idx).choice(
+                    len(points), self.num_points, replace=False
+                )
+            points = points[selected]
+        label = int(self.labels[idx])
+        if self.label_remap is not None:
+            label = self.label_remap[label]
         return {
-            "points": torch.from_numpy(np.asarray(self.points[idx], dtype=np.float32)),
-            "label": torch.tensor(int(self.labels[idx]), dtype=torch.long),
+            "points": torch.from_numpy(points.copy()),
+            "label": torch.tensor(label, dtype=torch.long),
         }
 
 
