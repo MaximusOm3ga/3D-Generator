@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-samples", type=int, default=1)
     p.add_argument("--output-dir", type=Path, default=Path("generated"))
     p.add_argument("--steps", type=int, default=100)
-    p.add_argument("--guidance-scale", type=float, default=2.0)
+    p.add_argument("--guidance-scale", type=float, default=1.0)
     p.add_argument("--eta", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -67,7 +67,7 @@ def main() -> None:
         raise ValueError(f"Unknown class {args.class_name!r}. Available: {', '.join(class_names)}")
     config = checkpoint["model_config"]
     model = ConditionalPointDenoiser(**config).to(device)
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(checkpoint.get("ema", checkpoint["model"]))
     model.eval()
     schedule = DiffusionSchedule(checkpoint["diffusion_config"]["timesteps"], device=device)
     torch.manual_seed(args.seed)
