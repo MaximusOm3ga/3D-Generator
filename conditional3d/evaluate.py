@@ -1,4 +1,3 @@
-"""Generate and sanity-check samples for every learned class."""
 from __future__ import annotations
 
 import argparse
