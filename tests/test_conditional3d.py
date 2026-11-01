@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import torch
 
-from conditional3d.data import normalize_points
+from conditional3d.data import normalize_points, PointCloudNPZDataset
 from conditional3d.model import ConditionalPointDenoiser, DiffusionSchedule, diffusion_loss
 
 
@@ -30,6 +30,25 @@ class Conditional3DTests(unittest.TestCase):
         t = torch.tensor([3])
         y = torch.tensor([model.null_class])
         self.assertEqual(model(x, t, y).shape, x.shape)
+
+    def test_dataset_subsampling_is_deterministic_or_random_as_configured(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "points.npz"
+            points = np.random.default_rng(7).normal(size=(3, 64, 3)).astype(np.float32)
+            np.savez(path, points=points, labels=np.array([0, 0, 1]),
+                     class_names=np.array(["airplane", "chair"]))
+
+            stable = PointCloudNPZDataset(path, num_points=16, random_subsample=False)
+            a = stable[0]["points"]
+            b = stable[0]["points"]
+            self.assertEqual(tuple(a.shape), (16, 3))
+            self.assertTrue(torch.equal(a, b))
+
+            random_ds = PointCloudNPZDataset(path, num_points=16, random_subsample=True)
+            self.assertEqual(tuple(random_ds[0]["points"].shape), (16, 3))
 
 
 if __name__ == "__main__":

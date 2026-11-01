@@ -1,8 +1,7 @@
-"""Point-cloud transformer denoiser and DDPM/DDIM utilities."""
+"""Fourier-conditioned AdaLN point-cloud transformer denoiser and DDPM/DDIM utilities."""
 from __future__ import annotations
 
 import math
-
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -20,27 +19,80 @@ def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 1000
     return embedding
 
 
-class ConditionalPointDenoiser(nn.Module):
-    """Permutation-equivariant point transformer predicting DDPM noise."""
+def fourier_xyz(points: torch.Tensor, bands: int = 6) -> torch.Tensor:
+    """Encode XYZ coordinates with fixed Fourier features; output dim is 3*(1+2*bands)."""
+    frequencies = (2.0 ** torch.arange(bands, device=points.device, dtype=points.dtype)) * math.pi
+    encoded = [points]
+    for frequency in frequencies:
+        encoded.extend((torch.sin(points * frequency), torch.cos(points * frequency)))
+    return torch.cat(encoded, dim=-1)
 
+
+class AdaLNPointBlock(nn.Module):
+    """Transformer block with per-layer time/class adaptive LayerNorm modulation."""
+    def __init__(self, width: int, heads: int, dropout: float = 0.0):
+        super().__init__()
+        if width % heads:
+            raise ValueError("width must be divisible by heads")
+        self.heads = heads
+        self.head_dim = width // heads
+        self.norm1 = nn.LayerNorm(width, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(width, elementwise_affine=False)
+        self.qkv = nn.Linear(width, 3 * width)
+        self.attn_proj = nn.Linear(width, width)
+        self.attn_dropout = dropout
+        self.mlp = nn.Sequential(
+            nn.Linear(width, width * 4), nn.GELU(),
+            nn.Dropout(dropout), nn.Linear(width * 4, width),
+        )
+        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(width, 6 * width))
+        nn.init.zeros_(self.ada[-1].weight)
+        nn.init.zeros_(self.ada[-1].bias)
+
+    def forward(self, x: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        shift1, scale1, gate1, shift2, scale2, gate2 = self.ada(condition).chunk(6, dim=-1)
+        shift1, scale1, gate1 = (v[:, None, :] for v in (shift1, scale1, gate1))
+        shift2, scale2, gate2 = (v[:, None, :] for v in (shift2, scale2, gate2))
+        batch, count, width = x.shape
+
+        h = self.norm1(x) * (1.0 + scale1) + shift1
+        qkv = self.qkv(h).reshape(batch, count, 3, self.heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        h = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.attn_dropout if self.training else 0.0
+        )
+        h = h.transpose(1, 2).reshape(batch, count, width)
+        x = x + gate1 * self.attn_proj(h)
+
+        h = self.norm2(x) * (1.0 + scale2) + shift2
+        return x + gate2 * self.mlp(h)
+
+
+class ConditionalPointDenoiser(nn.Module):
+    """Class/time-conditioned point transformer predicting DDPM noise."""
     def __init__(self, num_classes: int, points: int = 512, width: int = 256,
-                 depth: int = 6, heads: int = 8, dropout: float = 0.0):
+                 depth: int = 6, heads: int = 8, dropout: float = 0.0,
+                 fourier_bands: int = 6):
         super().__init__()
         if width % heads:
             raise ValueError("width must be divisible by heads")
         self.num_classes = int(num_classes)
         self.points = int(points)
         self.width = int(width)
+        self.heads = int(heads)
+        self.fourier_bands = int(fourier_bands)
         self.null_class = self.num_classes
-        self.point_in = nn.Sequential(nn.Linear(3, width), nn.GELU(), nn.Linear(width, width))
-        self.time_mlp = nn.Sequential(nn.Linear(width, width * 4), nn.SiLU(),
-                                      nn.Linear(width * 4, width))
-        self.class_embedding = nn.Embedding(num_classes + 1, width)
-        layer = nn.TransformerEncoderLayer(
-            d_model=width, nhead=heads, dim_feedforward=width * 4,
-            dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+        input_dim = 3 * (1 + 2 * self.fourier_bands)
+        self.point_in = nn.Sequential(
+            nn.Linear(input_dim, width), nn.GELU(), nn.Linear(width, width)
         )
-        self.transformer = nn.TransformerEncoder(layer, num_layers=depth, enable_nested_tensor=False)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(width, width * 4), nn.SiLU(), nn.Linear(width * 4, width)
+        )
+        self.class_embedding = nn.Embedding(num_classes + 1, width)
+        self.blocks = nn.ModuleList([
+            AdaLNPointBlock(width, heads, dropout) for _ in range(depth)
+        ])
         self.norm = nn.LayerNorm(width)
         self.point_out = nn.Sequential(nn.Linear(width, width), nn.GELU(), nn.Linear(width, 3))
         nn.init.zeros_(self.point_out[-1].weight)
@@ -56,8 +108,9 @@ class ConditionalPointDenoiser(nn.Module):
             raise ValueError("labels must have shape [B]")
         condition = self.time_mlp(timestep_embedding(timesteps, self.width))
         condition = condition + self.class_embedding(labels)
-        hidden = self.point_in(noisy_points) + condition[:, None, :]
-        hidden = self.transformer(hidden)
+        hidden = self.point_in(fourier_xyz(noisy_points, self.fourier_bands))
+        for block in self.blocks:
+            hidden = block(hidden, condition)
         return self.point_out(self.norm(hidden))
 
 
@@ -78,7 +131,7 @@ class DiffusionSchedule:
 
     @torch.no_grad()
     def sample(self, model: nn.Module, labels: torch.Tensor, points: int, steps: int = 100,
-               guidance_scale: float = 2.0, eta: float = 0.0) -> torch.Tensor:
+               guidance_scale: float = 1.0, eta: float = 0.0) -> torch.Tensor:
         """DDIM sampler with classifier-free guidance; returns normalized-space point coordinates."""
         if steps < 1 or steps > self.timesteps:
             raise ValueError(f"steps must be in [1, {self.timesteps}]")
